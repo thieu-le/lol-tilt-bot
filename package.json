@@ -1,0 +1,22 @@
+{
+  "name": "lol-tilt-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that detects League of Legends losses for tracked players and posts tilt messages.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "register-commands": "node scripts/registerCommands.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "lowdb": "^7.0.1"
+  },
+  "license": "MIT"
+}

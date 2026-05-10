@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.local
+
+# Persistent state. Never commit your tracked-player list.
+data/store.json
+
+# Editor / OS junk
+.DS_Store
+*.log
+.idea/
+.vscode/
