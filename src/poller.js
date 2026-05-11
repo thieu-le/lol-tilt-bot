@@ -42,7 +42,7 @@ const GAP_FETCH_COUNT = 20;
  * Process a single match for a player: update stats and optionally notify.
  * `player` must be the freshly-read record from storage before this call.
  */
-async function processMatch(player, matchId, channel) {
+async function processMatch(player, matchId, channel, { silent = false } = {}) {
   const match = await riot.getMatch(matchId);
   const summary = riot.extractMatchSummary(match, player.puuid);
   if (!summary) {
@@ -142,7 +142,7 @@ async function processMatch(player, matchId, channel) {
     }
   }
 
-  if (text) {
+  if (text && !silent) {
     try {
       await channel.send({ content: text, allowedMentions });
     } catch (err) {
@@ -151,14 +151,14 @@ async function processMatch(player, matchId, channel) {
   }
 }
 
-async function processPlayer(player, channel) {
+async function processPlayer(player, channel, { startup = false } = {}) {
   // Fetch enough IDs to cover any realistic offline gap. This is still one
   // HTTP call — the payload is just larger than count=1.
   const ids = await riot.getRecentMatchIds(player.puuid, GAP_FETCH_COUNT, { type: 'ranked' });
 
   if (!ids.length) {
     logger.debug(`No ranked matches yet for ${player.riotId.gameName}#${player.riotId.tagLine}`);
-    return;
+    return null;
   }
 
   // First-time bootstrap — record the latest without notifying.
@@ -167,7 +167,7 @@ async function processPlayer(player, channel) {
     logger.info(
       `Bootstrapped ${player.riotId.gameName}#${player.riotId.tagLine} at match ${ids[0]}`,
     );
-    return;
+    return null;
   }
 
   // Collect every ID that arrived after the last one we processed.
@@ -178,7 +178,7 @@ async function processPlayer(player, channel) {
     newIds.push(id);
   }
 
-  if (!newIds.length) return;
+  if (!newIds.length) return null;
 
   // Process oldest-first so streak/today/W-L accumulate in the right order.
   newIds.reverse();
@@ -189,14 +189,63 @@ async function processPlayer(player, channel) {
     );
   }
 
+  // Capture rank snapshot BEFORE processing so we can compute net LP delta for
+  // the startup report (pre vs post across all missed games).
+  const preRank = player.lastRank ?? null;
+
   for (const matchId of newIds) {
     // Re-read player state before each match so streak/today/rank are current.
     const current = storage.findByPuuid(player.puuid);
-    await processMatch(current, matchId, channel);
+    await processMatch(current, matchId, channel, { silent: startup });
+  }
+
+  if (!startup) return null;
+
+  // Build the per-player summary for the startup report.
+  const post = storage.findByPuuid(player.puuid);
+
+  // Only include in the report if at least one game was processed for today.
+  const todayKey = rank.utcDateKey();
+  if (post.today?.date !== todayKey) return null;
+
+  const rankLabel = post.lastRank ? rank.formatRank(post.lastRank) : null;
+  const netLpDelta = rank.computeLpDelta(preRank, post.lastRank);
+  const lpDeltaStr = rank.formatLpDelta(netLpDelta);
+
+  return {
+    riotId: post.riotId,
+    discordUserId: post.discordUserId,
+    today: post.today,
+    rankLabel,
+    lpDeltaStr,
+  };
+}
+
+async function postStartupReport(channel, summaries) {
+  const lines = summaries.map((s) => {
+    const token = s.discordUserId ? `<@${s.discordUserId}>` : `**${s.riotId.gameName}**`;
+    const record = `${s.today?.wins ?? 0}-${s.today?.losses ?? 0}`;
+    const parts = [record];
+    if (s.lpDeltaStr) parts.push(s.lpDeltaStr);
+    if (s.rankLabel) parts.push(s.rankLabel);
+    return `${token} ${parts.join(' • ')}`;
+  });
+
+  const mentionedIds = summaries
+    .filter((s) => s.discordUserId)
+    .map((s) => s.discordUserId);
+
+  try {
+    await channel.send({
+      content: `It is a good day for Tilt!\nDaily Reports for Tiltwatch:\n${lines.join('\n')}`,
+      allowedMentions: mentionedIds.length > 0 ? { users: mentionedIds } : { parse: [] },
+    });
+  } catch (err) {
+    logger.error(`Failed to post startup report: ${err.message}`);
   }
 }
 
-async function tick(channel) {
+async function tick(channel, { startup = false } = {}) {
   if (running) {
     logger.debug('Skipping tick — previous tick still running');
     return;
@@ -209,15 +258,22 @@ async function tick(channel) {
       return;
     }
     logger.debug(`Polling ${players.length} player(s)`);
+
+    const startupSummaries = [];
     for (const player of players) {
       try {
-        await processPlayer(player, channel);
+        const result = await processPlayer(player, channel, { startup });
+        if (startup && result) startupSummaries.push(result);
       } catch (err) {
         logger.error(
           `Error polling ${player.riotId.gameName}#${player.riotId.tagLine}: ${err.message}`,
         );
       }
       await sleep(PER_PLAYER_DELAY_MS);
+    }
+
+    if (startup && startupSummaries.length > 0) {
+      await postStartupReport(channel, startupSummaries);
     }
   } finally {
     running = false;
@@ -243,7 +299,7 @@ export async function startPoller({ client }) {
   logger.info(`Poller started (interval ${config.pollIntervalMs}ms)`);
   // Fire-and-forget the first tick so startup logs aren't blocked by a slow
   // Riot response.
-  tick(channel);
+  tick(channel, { startup: true });
   intervalHandle = setInterval(() => tick(channel), config.pollIntervalMs);
 }
 
