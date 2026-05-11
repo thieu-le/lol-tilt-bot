@@ -29,102 +29,71 @@ function sleep(ms) {
 }
 
 
-async function processPlayer(player, channel) {
-  // 1. Cheapest call first: latest RANKED match ID only. Filtering server-side
-  //    means ARAMs and normals never enter the pipeline.
-  const [latestId] = await riot.getRecentMatchIds(player.puuid, 1, { type: 'ranked' });
+// How many recent match IDs to fetch per tick. 20 covers any realistic offline
+// gap (most players don't play 20 ranked games between bot restarts).
+const GAP_FETCH_COUNT = 20;
 
-  if (!latestId) {
-    logger.debug(`No ranked matches yet for ${player.riotId.gameName}#${player.riotId.tagLine}`);
-    return;
-  }
-
-  // 2. First-time bootstrap — record the current latest WITHOUT notifying. The
-  //    bot only ever talks about matches that finish after a player was added.
-  if (player.lastProcessedMatchId === null) {
-    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: latestId });
-    logger.info(
-      `Bootstrapped ${player.riotId.gameName}#${player.riotId.tagLine} at match ${latestId}`,
-    );
-    return;
-  }
-
-  // 3. Nothing new since last tick.
-  if (latestId === player.lastProcessedMatchId) return;
-
-  // 4. New match. Fetch details and decide W/L + K/D/A.
-  const match = await riot.getMatch(latestId);
+/**
+ * Process a single match for a player: update stats and optionally notify.
+ * `player` must be the freshly-read record from storage before this call.
+ */
+async function processMatch(player, matchId, channel) {
+  const match = await riot.getMatch(matchId);
   const summary = riot.extractMatchSummary(match, player.puuid);
   if (!summary) {
-    // Defensive: shouldn't happen, but don't lose data if Riot returns an odd
-    // shape — record the match ID so we don't reprocess it forever.
     logger.warn(
-      `Match ${latestId} did not contain participant ${player.puuid} — skipping notification`,
+      `Match ${matchId} did not contain participant ${player.puuid} — skipping notification`,
     );
-    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: latestId });
+    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: matchId });
     return;
   }
 
   const { won, kills, deaths, queueId, gameEndTimestamp, gameStartTimestamp } = summary;
 
-  // Safety net: even with the API-level type=ranked filter, refuse to process
-  // anything that isn't queue 420 or 440. Keeps non-ranked games entirely out
-  // of streak/today/W-L counters.
   if (!rank.isRankedQueue(queueId)) {
     logger.debug(
-      `Match ${latestId} for ${player.riotId.gameName}#${player.riotId.tagLine} was non-ranked (queue ${queueId}) — skipping`,
+      `Match ${matchId} for ${player.riotId.gameName}#${player.riotId.tagLine} was non-ranked (queue ${queueId}) — skipping`,
     );
-    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: latestId });
+    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: matchId });
     return;
   }
 
-  // Stale-match guard: if the match's UTC date predates today, treat it as
-  // history we just hadn't ingested yet — no notification, no counter changes,
-  // just record the ID so we don't reprocess it forever. Prevents yesterday's
-  // game from showing up as "today's loss" after a restart or first deploy.
+  // Stale-match guard: matches from previous UTC days update no counters and
+  // send no notifications. Prevents old games from warping today's record when
+  // the bot was offline overnight.
   const matchDate = rank.dateKeyForTimestamp(gameEndTimestamp ?? gameStartTimestamp);
   const todayKey = rank.utcDateKey();
   if (matchDate && matchDate !== todayKey) {
     logger.info(
-      `Match ${latestId} for ${player.riotId.gameName}#${player.riotId.tagLine} ended ${matchDate} (not today ${todayKey}) — recording as historical, no notification`,
+      `Match ${matchId} for ${player.riotId.gameName}#${player.riotId.tagLine} ended ${matchDate} (not today ${todayKey}) — historical, no notification`,
     );
-    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: latestId });
+    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: matchId });
     return;
   }
 
   const newStreak = nextStreak(player.streak, won);
   const newToday = nextToday(player.today, won);
 
-  // 5. For ranked matches, fetch the current league entry, diff against the
-  //    previous snapshot to compute LP delta, and persist the new snapshot.
-  //    Skipped entirely for non-ranked queues to avoid wasting API calls.
   let lpDeltaStr = null;
   let rankLabel = null;
   let newLastRank = player.lastRank ?? null;
-  if (rank.isRankedQueue(queueId)) {
-    try {
-      const entries = await riot.getRankedEntries(player.puuid);
-      const entry = rank.findEntryForQueue(entries, queueId);
-      if (entry) {
-        const snapshot = rank.entryToSnapshot(entry);
-        // Only compute a delta when we have a prior snapshot of the SAME queue.
-        // Otherwise this is just the first time we see this queue for them.
-        if (player.lastRank && player.lastRank.queueType === snapshot.queueType) {
-          lpDeltaStr = rank.formatLpDelta(rank.computeLpDelta(player.lastRank, snapshot));
-        }
-        rankLabel = rank.formatRank(snapshot);
-        newLastRank = snapshot;
+  try {
+    const entries = await riot.getRankedEntries(player.puuid);
+    const entry = rank.findEntryForQueue(entries, queueId);
+    if (entry) {
+      const snapshot = rank.entryToSnapshot(entry);
+      if (player.lastRank && player.lastRank.queueType === snapshot.queueType) {
+        lpDeltaStr = rank.formatLpDelta(rank.computeLpDelta(player.lastRank, snapshot));
       }
-    } catch (err) {
-      logger.warn(`Failed to fetch ranked entries for ${player.puuid}: ${err.message}`);
+      rankLabel = rank.formatRank(snapshot);
+      newLastRank = snapshot;
     }
-  } else if (player.lastRank) {
-    // Non-ranked match — still display the previously-known rank for context.
-    rankLabel = rank.formatRank(player.lastRank);
+  } catch (err) {
+    logger.warn(`Failed to fetch ranked entries for ${player.puuid}: ${err.message}`);
   }
 
   await storage.updatePlayer(player.puuid, {
-    lastProcessedMatchId: latestId,
+    lastProcessedMatchId: matchId,
     streak: newStreak,
     today: newToday,
     lastRank: newLastRank,
@@ -133,20 +102,14 @@ async function processPlayer(player, channel) {
   });
 
   logger.info(
-    `Match ${latestId} for ${player.riotId.gameName}#${player.riotId.tagLine}: ${
+    `Match ${matchId} for ${player.riotId.gameName}#${player.riotId.tagLine}: ${
       won ? 'WIN' : 'LOSS'
     } ${kills}/${deaths} q${queueId} (streak ${newStreak.type}${newStreak.count}, today ${newToday.wins}-${newToday.losses}, lp ${lpDeltaStr ?? 'n/a'})`,
   );
 
-  // 6. Only losses get a Discord ping.
   if (!won) {
-    // KD ratio (assists deliberately excluded). Positive KD on a loss means
-    // they got more kills than deaths individually — earns the Drew Levin curse.
     const kd = kills / Math.max(deaths, 1);
     const positiveKd = kd >= 1.0;
-
-    // If the player is linked to a Discord user, use a real mention so they
-    // actually get notified. Otherwise fall back to a bolded Riot name.
     const displayToken = player.discordUserId
       ? `<@${player.discordUserId}>`
       : `**${player.riotId.gameName}**`;
@@ -159,8 +122,6 @@ async function processPlayer(player, channel) {
     try {
       await channel.send({
         content: text,
-        // Whitelist only the linked user — never expand @everyone / @here
-        // even if a future message template happens to include them.
         allowedMentions: player.discordUserId
           ? { users: [player.discordUserId] }
           : { parse: [] },
@@ -168,6 +129,51 @@ async function processPlayer(player, channel) {
     } catch (err) {
       logger.error(`Failed to post tilt message: ${err.message}`);
     }
+  }
+}
+
+async function processPlayer(player, channel) {
+  // Fetch enough IDs to cover any realistic offline gap. This is still one
+  // HTTP call — the payload is just larger than count=1.
+  const ids = await riot.getRecentMatchIds(player.puuid, GAP_FETCH_COUNT, { type: 'ranked' });
+
+  if (!ids.length) {
+    logger.debug(`No ranked matches yet for ${player.riotId.gameName}#${player.riotId.tagLine}`);
+    return;
+  }
+
+  // First-time bootstrap — record the latest without notifying.
+  if (player.lastProcessedMatchId === null) {
+    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: ids[0] });
+    logger.info(
+      `Bootstrapped ${player.riotId.gameName}#${player.riotId.tagLine} at match ${ids[0]}`,
+    );
+    return;
+  }
+
+  // Collect every ID that arrived after the last one we processed.
+  // ids is newest-first; we stop the moment we hit the known ID.
+  const newIds = [];
+  for (const id of ids) {
+    if (id === player.lastProcessedMatchId) break;
+    newIds.push(id);
+  }
+
+  if (!newIds.length) return;
+
+  // Process oldest-first so streak/today/W-L accumulate in the right order.
+  newIds.reverse();
+
+  if (newIds.length > 1) {
+    logger.info(
+      `${player.riotId.gameName}#${player.riotId.tagLine}: catching up ${newIds.length} missed match(es)`,
+    );
+  }
+
+  for (const matchId of newIds) {
+    // Re-read player state before each match so streak/today/rank are current.
+    const current = storage.findByPuuid(player.puuid);
+    await processMatch(current, matchId, channel);
   }
 }
 
