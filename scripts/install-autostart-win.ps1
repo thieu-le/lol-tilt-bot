@@ -17,9 +17,7 @@ $Action   = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$VbsPath
 $Trigger  = New-ScheduledTaskTrigger -AtLogOn
 $Settings = New-ScheduledTaskSettingsSet `
               -ExecutionTimeLimit 0 `
-              -MultipleInstances IgnoreNew `
-              -DisallowStartIfOnBatteries $false `
-              -StopIfGoingOnBatteries $false
+              -MultipleInstances IgnoreNew
 
 # Remove any existing registration first so re-running this script is safe.
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
