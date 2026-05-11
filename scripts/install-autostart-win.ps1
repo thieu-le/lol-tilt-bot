@@ -1,9 +1,9 @@
-# Install lol-tilt-bot as a Windows Task Scheduler task that runs silently at login.
-# Run once: npm run install-autostart
-# Requires PowerShell running as Administrator (or a standard user with Task Scheduler write access).
+# Install lol-tilt-bot to the Windows Startup folder so it runs silently at login.
+# No administrator privileges required.
+# Run: npm run install-autostart
 
 $BotDir  = Split-Path -Parent $PSScriptRoot
-$VbsPath = Join-Path $PSScriptRoot "start-hidden.vbs"
+$VbsSrc  = Join-Path $PSScriptRoot "start-hidden.vbs"
 
 $NodeBin = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $NodeBin) {
@@ -11,30 +11,15 @@ if (-not $NodeBin) {
     exit 1
 }
 
-$TaskName = "lol-tilt-bot"
+$StartupDir = [Environment]::GetFolderPath('Startup')
+$VbsDst     = Join-Path $StartupDir "lol-tilt-bot.vbs"
 
-$Action   = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$VbsPath`""
-$Trigger  = New-ScheduledTaskTrigger -AtLogOn
-$Settings = New-ScheduledTaskSettingsSet `
-              -ExecutionTimeLimit 0 `
-              -MultipleInstances IgnoreNew
-
-# Remove any existing registration first so re-running this script is safe.
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-
-Register-ScheduledTask `
-    -TaskName   $TaskName `
-    -Action     $Action `
-    -Trigger    $Trigger `
-    -Settings   $Settings `
-    -Description "lol-tilt-bot Discord bot" `
-    -Force | Out-Null
+Copy-Item $VbsSrc $VbsDst -Force
 
 Write-Host ""
-Write-Host "lol-tilt-bot will now start silently at login."
-Write-Host "  Node:     $NodeBin"
-Write-Host "  Bot:      $BotDir\src\index.js"
+Write-Host "lol-tilt-bot will now start silently at every login."
+Write-Host "  Startup file: $VbsDst"
+Write-Host "  Node:         $NodeBin"
+Write-Host "  Bot:          $BotDir\src\index.js"
 Write-Host ""
-Write-Host "  Start now:  Start-ScheduledTask -TaskName '$TaskName'"
-Write-Host "  Stop now:   Stop-ScheduledTask  -TaskName '$TaskName'"
-Write-Host "  Uninstall:  npm run uninstall-autostart"
+Write-Host "  Uninstall: npm run uninstall-autostart"

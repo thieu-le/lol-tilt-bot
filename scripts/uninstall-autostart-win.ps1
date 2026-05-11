@@ -1,14 +1,13 @@
-# Remove the lol-tilt-bot Task Scheduler task.
+# Remove lol-tilt-bot from the Windows Startup folder.
 # Run: npm run uninstall-autostart
 
-$TaskName = "lol-tilt-bot"
+$StartupDir = [Environment]::GetFolderPath('Startup')
+$VbsDst     = Join-Path $StartupDir "lol-tilt-bot.vbs"
 
-$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if (-not $task) {
-    Write-Host "Autostart not installed (task '$TaskName' not found)."
+if (-not (Test-Path $VbsDst)) {
+    Write-Host "Autostart not installed ($VbsDst not found)."
     exit 0
 }
 
-Stop-ScheduledTask  -TaskName $TaskName -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+Remove-Item $VbsDst -Force
 Write-Host "lol-tilt-bot autostart removed. The bot will no longer start at login."
