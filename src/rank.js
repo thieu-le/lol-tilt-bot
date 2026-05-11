@@ -130,6 +130,23 @@ export function formatLpDelta(delta) {
 }
 
 /**
+ * Detect whether a rank change between two snapshots of the same queue was a
+ * promotion, demotion, or neither. Returns null if either snapshot is missing
+ * or the queues don't match.
+ *
+ * @returns {'promoted' | 'demoted' | null}
+ */
+export function getRankChange(prev, curr) {
+  if (!prev || !curr) return null;
+  if (prev.queueType !== curr.queueType) return null;
+  const prevIdx = ladderIndex(prev);
+  const currIdx = ladderIndex(curr);
+  if (currIdx > prevIdx) return 'promoted';
+  if (currIdx < prevIdx) return 'demoted';
+  return null;
+}
+
+/**
  * Compute the new streak after observing a match outcome.
  *
  * @param {{ type: 'W'|'L'|null, count: number }} prev

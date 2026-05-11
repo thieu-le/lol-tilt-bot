@@ -15,7 +15,12 @@ import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import * as rank from './rank.js';
 import { nextStreak, nextToday } from './rank.js';
-import { pickTiltMessage } from './messages.js';
+import {
+  pickTiltMessage,
+  pickDemotionMessage,
+  pickPromotionMessage,
+  pickWinStreakMessage,
+} from './messages.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
 
@@ -77,11 +82,13 @@ async function processMatch(player, matchId, channel) {
   let lpDeltaStr = null;
   let rankLabel = null;
   let newLastRank = player.lastRank ?? null;
+  let rankChange = null;
   try {
     const entries = await riot.getRankedEntries(player.puuid);
     const entry = rank.findEntryForQueue(entries, queueId);
     if (entry) {
       const snapshot = rank.entryToSnapshot(entry);
+      rankChange = rank.getRankChange(player.lastRank, snapshot);
       if (player.lastRank && player.lastRank.queueType === snapshot.queueType) {
         lpDeltaStr = rank.formatLpDelta(rank.computeLpDelta(player.lastRank, snapshot));
       }
@@ -104,30 +111,42 @@ async function processMatch(player, matchId, channel) {
   logger.info(
     `Match ${matchId} for ${player.riotId.gameName}#${player.riotId.tagLine}: ${
       won ? 'WIN' : 'LOSS'
-    } ${kills}/${deaths} q${queueId} (streak ${newStreak.type}${newStreak.count}, today ${newToday.wins}-${newToday.losses}, lp ${lpDeltaStr ?? 'n/a'})`,
+    } ${kills}/${deaths} q${queueId} (streak ${newStreak.type}${newStreak.count}, today ${newToday.wins}-${newToday.losses}, lp ${lpDeltaStr ?? 'n/a'}${rankChange ? ` [${rankChange}]` : ''})`,
   );
+
+  const displayToken = player.discordUserId
+    ? `<@${player.discordUserId}>`
+    : `**${player.riotId.gameName}**`;
+  const allowedMentions = player.discordUserId
+    ? { users: [player.discordUserId] }
+    : { parse: [] };
+  const detailOpts = { lpDelta: lpDeltaStr, today: newToday, rankLabel };
+
+  let text = null;
 
   if (!won) {
     const kd = kills / Math.max(deaths, 1);
-    const positiveKd = kd >= 1.0;
-    const displayToken = player.discordUserId
-      ? `<@${player.discordUserId}>`
-      : `**${player.riotId.gameName}**`;
-    const text = pickTiltMessage(displayToken, newStreak, {
-      positiveKd,
-      lpDelta: lpDeltaStr,
-      today: newToday,
-      rankLabel,
-    });
-    try {
-      await channel.send({
-        content: text,
-        allowedMentions: player.discordUserId
-          ? { users: [player.discordUserId] }
-          : { parse: [] },
+    if (rankChange === 'demoted') {
+      text = pickDemotionMessage(displayToken, detailOpts);
+    } else {
+      text = pickTiltMessage(displayToken, newStreak, {
+        ...detailOpts,
+        positiveKd: kd >= 1.0,
       });
+    }
+  } else {
+    if (rankChange === 'promoted') {
+      text = pickPromotionMessage(displayToken, detailOpts);
+    } else if (newStreak.type === 'W' && newStreak.count >= 4) {
+      text = pickWinStreakMessage(displayToken, newStreak, detailOpts);
+    }
+  }
+
+  if (text) {
+    try {
+      await channel.send({ content: text, allowedMentions });
     } catch (err) {
-      logger.error(`Failed to post tilt message: ${err.message}`);
+      logger.error(`Failed to post message: ${err.message}`);
     }
   }
 }
