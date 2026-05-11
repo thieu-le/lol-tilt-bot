@@ -14,6 +14,7 @@
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import * as rank from './rank.js';
+import { nextStreak, nextToday } from './rank.js';
 import { pickTiltMessage } from './messages.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
@@ -27,31 +28,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Compute the new streak after observing a match outcome.
- *
- * @param {{ type: 'W'|'L'|null, count: number }} prev
- * @param {boolean} won
- */
-function nextStreak(prev, won) {
-  const type = won ? 'W' : 'L';
-  if (prev?.type === type) return { type, count: prev.count + 1 };
-  return { type, count: 1 };
-}
-
-/**
- * Compute today's record after one match, resetting on UTC date change.
- * Returns the new {date, wins, losses} object to persist.
- */
-function nextToday(prev, won) {
-  const today = rank.utcDateKey();
-  const base = prev?.date === today ? prev : { date: today, wins: 0, losses: 0 };
-  return {
-    date: today,
-    wins: base.wins + (won ? 1 : 0),
-    losses: base.losses + (won ? 0 : 1),
-  };
-}
 
 async function processPlayer(player, channel) {
   // 1. Cheapest call first: latest RANKED match ID only. Filtering server-side

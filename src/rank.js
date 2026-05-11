@@ -130,6 +130,31 @@ export function formatLpDelta(delta) {
 }
 
 /**
+ * Compute the new streak after observing a match outcome.
+ *
+ * @param {{ type: 'W'|'L'|null, count: number }} prev
+ * @param {boolean} won
+ */
+export function nextStreak(prev, won) {
+  const type = won ? 'W' : 'L';
+  if (prev?.type === type) return { type, count: prev.count + 1 };
+  return { type, count: 1 };
+}
+
+/**
+ * Compute today's record after one match, resetting on UTC date change.
+ */
+export function nextToday(prev, won) {
+  const today = utcDateKey();
+  const base = prev?.date === today ? prev : { date: today, wins: 0, losses: 0 };
+  return {
+    date: today,
+    wins: base.wins + (won ? 1 : 0),
+    losses: base.losses + (won ? 0 : 1),
+  };
+}
+
+/**
  * Current UTC date in YYYY-MM-DD form. Used as the bucket key for today's record.
  */
 export function utcDateKey(date = new Date()) {

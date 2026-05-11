@@ -7,6 +7,7 @@
 import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
+import { backfillTodayMatches } from './backfill.js';
 import { logger } from './logger.js';
 
 // --- Definitions -----------------------------------------------------------
@@ -148,26 +149,30 @@ async function handleTrackAdd(interaction) {
     throw err;
   }
 
-  // Bootstrap with current latest RANKED match so we don't fire on historical
-  // games. We only track ranked, so the filter matches the poller's behavior.
-  let lastProcessedMatchId = null;
-  try {
-    const [latest] = await riot.getRecentMatchIds(account.puuid, 1, { type: 'ranked' });
-    lastProcessedMatchId = latest ?? null;
-  } catch (err) {
-    logger.warn(`Could not fetch latest match for bootstrap: ${err.message}`);
-  }
-
+  // Add the player with no lastProcessedMatchId yet — backfill handles that.
   await storage.addPlayer({
     puuid: account.puuid,
     riotId: { gameName: account.gameName, tagLine: account.tagLine },
-    lastProcessedMatchId,
+    lastProcessedMatchId: null,
     discordUserId: mentionUser?.id ?? null,
   });
 
+  // Backfill today's ranked matches silently (no notifications), then set
+  // lastProcessedMatchId to the current latest so the poller starts fresh.
+  let backfilledCount = 0;
+  try {
+    backfilledCount = await backfillTodayMatches(account.puuid);
+  } catch (err) {
+    logger.warn(`Backfill failed for ${account.puuid}: ${err.message}`);
+  }
+
   const linkNote = mentionUser ? ` — losses will ping <@${mentionUser.id}>` : '';
+  const backfillNote =
+    backfilledCount > 0
+      ? ` Caught up ${backfilledCount} game(s) from today.`
+      : '';
   await interaction.editReply(
-    `Now tracking **${account.gameName}#${account.tagLine}**${linkNote}. Lose a game to test 👀`,
+    `Now tracking **${account.gameName}#${account.tagLine}**${linkNote}.${backfillNote} Lose a game to test 👀`,
   );
 }
 

@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "register-commands": "node scripts/registerCommands.js"
+    "register-commands": "node scripts/registerCommands.js",
+    "install-autostart": "powershell -ExecutionPolicy Bypass -File scripts/install-autostart-win.ps1",
+    "uninstall-autostart": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-autostart-win.ps1"
   },
   "dependencies": {
     "axios": "^1.7.7",
