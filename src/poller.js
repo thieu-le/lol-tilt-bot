@@ -90,7 +90,9 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       const snapshot = rank.entryToSnapshot(entry);
       rankChange = rank.getRankChange(player.lastRank, snapshot);
       if (player.lastRank && player.lastRank.queueType === snapshot.queueType) {
-        lpDeltaStr = rank.formatLpDelta(rank.computeLpDelta(player.lastRank, snapshot));
+        const lpDeltaNum = rank.computeLpDelta(player.lastRank, snapshot);
+        lpDeltaStr = rank.formatLpDelta(lpDeltaNum);
+        if (lpDeltaNum !== null) newToday.lpDelta = (newToday.lpDelta ?? 0) + lpDeltaNum;
       }
       rankLabel = rank.formatRank(snapshot);
       newLastRank = snapshot;
@@ -245,6 +247,66 @@ async function postStartupReport(channel, summaries) {
   }
 }
 
+async function postEndOfDayReport(channel) {
+  const players = storage.getPlayers();
+  const todayKey = rank.utcDateKey();
+
+  // Only include players who have played ranked today.
+  const entries = players
+    .filter((p) => p.today?.date === todayKey)
+    .map((p) => ({
+      riotId: p.riotId,
+      discordUserId: p.discordUserId,
+      lpDelta: p.today.lpDelta ?? 0,
+    }))
+    .sort((a, b) => a.lpDelta - b.lpDelta); // most LP lost first
+
+  if (!entries.length) return;
+
+  // Total LP surrendered to the Tilt Gods (only negative contributions count).
+  const totalSacrificed = Math.abs(
+    entries.reduce((sum, e) => sum + Math.min(e.lpDelta, 0), 0),
+  );
+
+  const lines = entries.map((e, i) => {
+    const token = e.discordUserId ? `<@${e.discordUserId}>` : `**${e.riotId.gameName}**`;
+    const lpStr = rank.formatLpDelta(e.lpDelta) ?? '+0 LP';
+    return `${i + 1}. ${token} ${lpStr}`;
+  });
+
+  const mentionedIds = entries.filter((e) => e.discordUserId).map((e) => e.discordUserId);
+
+  try {
+    await channel.send({
+      content: `Thus ends another day of tilt. ${totalSacrificed} LP has been sacrificed to the Tilt Gods.\nTilt Patreon Leaderboard:\n${lines.join('\n')}`,
+      allowedMentions: mentionedIds.length > 0 ? { users: mentionedIds } : { parse: [] },
+    });
+  } catch (err) {
+    logger.error(`Failed to post end-of-day report: ${err.message}`);
+  }
+}
+
+function scheduleEndOfDayReport(channel) {
+  const now = Date.now();
+  // Next UTC midnight, minus 1 minute → 23:59 UTC.
+  const d = new Date();
+  const nextMidnightUTC = Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth(),
+    d.getUTCDate() + 1,
+  );
+  const triggerAt = nextMidnightUTC - 60_000;
+  const delay = Math.max(triggerAt - now, 0);
+
+  setTimeout(async () => {
+    await postEndOfDayReport(channel);
+    scheduleEndOfDayReport(channel); // reschedule for the next day
+  }, delay);
+
+  const fireTime = new Date(triggerAt).toISOString();
+  logger.info(`End-of-day report scheduled for ${fireTime}`);
+}
+
 async function tick(channel, { startup = false } = {}) {
   if (running) {
     logger.debug('Skipping tick — previous tick still running');
@@ -301,6 +363,7 @@ export async function startPoller({ client }) {
   // Riot response.
   tick(channel, { startup: true });
   intervalHandle = setInterval(() => tick(channel), config.pollIntervalMs);
+  scheduleEndOfDayReport(channel);
 }
 
 export function stopPoller() {

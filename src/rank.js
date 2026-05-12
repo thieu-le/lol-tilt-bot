@@ -163,11 +163,12 @@ export function nextStreak(prev, won) {
  */
 export function nextToday(prev, won) {
   const today = utcDateKey();
-  const base = prev?.date === today ? prev : { date: today, wins: 0, losses: 0 };
+  const base = prev?.date === today ? prev : { date: today, wins: 0, losses: 0, lpDelta: 0 };
   return {
     date: today,
     wins: base.wins + (won ? 1 : 0),
     losses: base.losses + (won ? 0 : 1),
+    lpDelta: base.lpDelta ?? 0, // caller adds this match's numeric delta after
   };
 }
 
