@@ -251,21 +251,36 @@ async function postEndOfDayReport(channel) {
   const players = storage.getPlayers();
   const todayKey = rank.utcDateKey();
 
-  // Only include players who have played ranked today.
-  const entries = players
-    .filter((p) => p.today?.date === todayKey)
+  // If nobody played ranked today at all, stay silent.
+  const playedToday = players.filter((p) => p.today?.date === todayKey);
+  if (!playedToday.length) return;
+
+  // Only losers go on the leaderboard.
+  const entries = playedToday
     .map((p) => ({
       riotId: p.riotId,
       discordUserId: p.discordUserId,
       lpDelta: p.today.lpDelta ?? 0,
     }))
+    .filter((e) => e.lpDelta < 0)
     .sort((a, b) => a.lpDelta - b.lpDelta); // most LP lost first
 
-  if (!entries.length) return;
+  // Players played but nobody lost LP — acknowledge the rare good day.
+  if (!entries.length) {
+    try {
+      await channel.send({
+        content: 'No tilt today 🙏 the Tilt Gods are unsatisfied.',
+        allowedMentions: { parse: [] },
+      });
+    } catch (err) {
+      logger.error(`Failed to post no-tilt report: ${err.message}`);
+    }
+    return;
+  }
 
-  // Total LP surrendered to the Tilt Gods (only negative contributions count).
+  // Total LP surrendered to the Tilt Gods (all entries are negative now).
   const totalSacrificed = Math.abs(
-    entries.reduce((sum, e) => sum + Math.min(e.lpDelta, 0), 0),
+    entries.reduce((sum, e) => sum + e.lpDelta, 0),
   );
 
   const lines = entries.map((e, i) => {
@@ -295,8 +310,12 @@ function scheduleEndOfDayReport(channel) {
     d.getUTCMonth(),
     d.getUTCDate() + 1,
   );
-  const triggerAt = nextMidnightUTC - 60_000;
-  const delay = Math.max(triggerAt - now, 0);
+  // If we're already inside the 23:59 minute (or rescheduling right after
+  // firing), nextMidnightUTC - 60_000 resolves to a moment <= now and the
+  // setTimeout would fire immediately, looping for ~60s. Push forward 24h.
+  let triggerAt = nextMidnightUTC - 60_000;
+  if (triggerAt <= now) triggerAt += 24 * 60 * 60 * 1000;
+  const delay = triggerAt - now;
 
   setTimeout(async () => {
     await postEndOfDayReport(channel);
