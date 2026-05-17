@@ -134,6 +134,18 @@ export async function getMatch(matchId) {
 export function extractMatchSummary(match, puuid) {
   const p = match?.info?.participants?.find((x) => x.puuid === puuid);
   if (!p) return null;
+
+  // Damage share = this player's champ-damage / their team's total champ-damage.
+  // Used by the tilt meter to weight "carry vs. AFK" beyond raw KDA.
+  const participants = match.info?.participants ?? [];
+  const sameTeam = participants.filter((x) => x.teamId === p.teamId);
+  const teamDamage = sameTeam.reduce(
+    (sum, x) => sum + (x.totalDamageDealtToChampions ?? 0),
+    0,
+  );
+  const playerDamage = p.totalDamageDealtToChampions ?? 0;
+  const damageShare = teamDamage > 0 ? playerDamage / teamDamage : null;
+
   return {
     matchId: match.metadata?.matchId ?? null,
     won: Boolean(p.win),
@@ -144,6 +156,8 @@ export function extractMatchSummary(match, puuid) {
     queueId: match.info?.queueId ?? null,
     gameStartTimestamp: match.info?.gameStartTimestamp ?? null,
     gameDuration: match.info?.gameDuration ?? null,
+    totalDamageDealtToChampions: playerDamage,
+    damageShare,
   };
 }
 

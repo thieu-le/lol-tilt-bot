@@ -90,6 +90,7 @@ export async function addPlayer(player) {
     losses: player.losses ?? 0,
     today: player.today ?? { date: null, wins: 0, losses: 0 },
     lastRank: player.lastRank ?? null,
+    cursers: player.cursers ?? [],
     addedAt: player.addedAt ?? new Date().toISOString(),
   });
   await db.write();

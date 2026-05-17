@@ -8,6 +8,8 @@ import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import { backfillTodayMatches } from './backfill.js';
+import { buildCurseAppliedMessage } from './messages.js';
+import { config } from './config.js';
 import { logger } from './logger.js';
 
 // --- Definitions -----------------------------------------------------------
@@ -75,10 +77,32 @@ const historyCommand = new SlashCommandBuilder()
       .setRequired(false),
   );
 
+const curseCommand = new SlashCommandBuilder()
+  .setName('curse')
+  .setDescription('Curse a tracked player into LosersQ until they win a ranked game')
+  .addStringOption((opt) =>
+    opt.setName('gamename').setDescription("Target's Riot ID game name (before #)").setRequired(true),
+  )
+  .addStringOption((opt) =>
+    opt.setName('tagline').setDescription("Target's Riot ID tag line (after #)").setRequired(true),
+  );
+
+const uncurseCommand = new SlashCommandBuilder()
+  .setName('uncurse')
+  .setDescription('Lift your own curse on a tracked player (only removes your entry)')
+  .addStringOption((opt) =>
+    opt.setName('gamename').setDescription('Riot ID game name').setRequired(true),
+  )
+  .addStringOption((opt) =>
+    opt.setName('tagline').setDescription('Riot ID tag line').setRequired(true),
+  );
+
 export const commandData = [
   trackCommand.toJSON(),
   streakCommand.toJSON(),
   historyCommand.toJSON(),
+  curseCommand.toJSON(),
+  uncurseCommand.toJSON(),
 ];
 
 // Most common Riot queue IDs — anything not in here falls back to "Queue {id}".
@@ -279,6 +303,94 @@ async function handleHistory(interaction) {
   await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
 }
 
+async function handleCurse(interaction) {
+  const gameName = interaction.options.getString('gamename', true);
+  const tagLine = interaction.options.getString('tagline', true);
+
+  const target = storage.findByRiotId(gameName, tagLine);
+  if (!target) {
+    await interaction.editReply(
+      `Not tracking **${gameName}#${tagLine}** — add them with \`/track add\` first.`,
+    );
+    return;
+  }
+
+  const curserDiscordId = interaction.user.id;
+  const existing = target.cursers ?? [];
+
+  if (existing.some((c) => c.curserDiscordId === curserDiscordId)) {
+    await interaction.editReply(
+      `You've already cursed **${target.riotId.gameName}#${target.riotId.tagLine}**. They need to win a ranked game to break it.`,
+    );
+    return;
+  }
+
+  const next = [
+    ...existing,
+    {
+      curserDiscordId,
+      curserDisplayName: interaction.user.username,
+      cursedAt: new Date().toISOString(),
+    },
+  ];
+  await storage.updatePlayer(target.puuid, { cursers: next });
+
+  const targetMention = target.discordUserId
+    ? `<@${target.discordUserId}>`
+    : `**${target.riotId.gameName}**`;
+  const curserMention = `<@${curserDiscordId}>`;
+  const targetMentionIds = target.discordUserId ? [target.discordUserId] : [];
+
+  try {
+    const channel = await interaction.client.channels.fetch(config.discord.channelId);
+    await channel.send({
+      content: buildCurseAppliedMessage(targetMention, curserMention, next.length),
+      allowedMentions:
+        targetMentionIds.length > 0 ? { users: targetMentionIds } : { parse: [] },
+    });
+  } catch (err) {
+    logger.error(`Failed to post curse-applied message: ${err.message}`);
+  }
+
+  await interaction.editReply(
+    `Curse applied to **${target.riotId.gameName}#${target.riotId.tagLine}** — now cursed by ${next.length} player(s). 🪦`,
+  );
+}
+
+async function handleUncurse(interaction) {
+  const gameName = interaction.options.getString('gamename', true);
+  const tagLine = interaction.options.getString('tagline', true);
+
+  const target = storage.findByRiotId(gameName, tagLine);
+  if (!target) {
+    await interaction.editReply(`Not tracking **${gameName}#${tagLine}**.`);
+    return;
+  }
+
+  const userId = interaction.user.id;
+  const existing = target.cursers ?? [];
+  const filtered = existing.filter((c) => c.curserDiscordId !== userId);
+
+  if (filtered.length === existing.length) {
+    await interaction.editReply(
+      `You haven't cursed **${target.riotId.gameName}#${target.riotId.tagLine}**.`,
+    );
+    return;
+  }
+
+  await storage.updatePlayer(target.puuid, { cursers: filtered });
+
+  if (filtered.length === 0) {
+    await interaction.editReply(
+      `Your curse on **${target.riotId.gameName}#${target.riotId.tagLine}** is lifted — they're no longer cursed.`,
+    );
+  } else {
+    await interaction.editReply(
+      `Your curse on **${target.riotId.gameName}#${target.riotId.tagLine}** is lifted. Still cursed by ${filtered.length} other player(s).`,
+    );
+  }
+}
+
 async function handleStreak(interaction) {
   const gameName = interaction.options.getString('gamename', true);
   const tagLine = interaction.options.getString('tagline', true);
@@ -316,6 +428,12 @@ export async function handleInteraction(interaction) {
     }
     if (interaction.commandName === 'history') {
       return await handleHistory(interaction);
+    }
+    if (interaction.commandName === 'curse') {
+      return await handleCurse(interaction);
+    }
+    if (interaction.commandName === 'uncurse') {
+      return await handleUncurse(interaction);
     }
     await interaction.editReply(`Unknown command: ${interaction.commandName}`);
   } catch (err) {

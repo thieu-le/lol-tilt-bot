@@ -20,6 +20,9 @@ import {
   pickDemotionMessage,
   pickPromotionMessage,
   pickWinStreakMessage,
+  computeTiltMeter,
+  buildCurseBrokenMessage,
+  buildCurseLossMessage,
 } from './messages.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
@@ -53,7 +56,16 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     return;
   }
 
-  const { won, kills, deaths, queueId, gameEndTimestamp, gameStartTimestamp } = summary;
+  const {
+    won,
+    kills,
+    deaths,
+    assists,
+    queueId,
+    gameEndTimestamp,
+    gameStartTimestamp,
+    damageShare,
+  } = summary;
 
   if (!rank.isRankedQueue(queueId)) {
     logger.debug(
@@ -122,7 +134,17 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   const allowedMentions = player.discordUserId
     ? { users: [player.discordUserId] }
     : { parse: [] };
-  const detailOpts = { lpDelta: lpDeltaStr, today: newToday, rankLabel };
+  const tiltMeter = computeTiltMeter({ kills, deaths, assists, damageShare, won });
+  const detailOpts = {
+    lpDelta: lpDeltaStr,
+    today: newToday,
+    rankLabel,
+    tiltMeter,
+    kills,
+    deaths,
+    assists,
+    damageShare,
+  };
 
   let text = null;
 
@@ -149,6 +171,33 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       await channel.send({ content: text, allowedMentions });
     } catch (err) {
       logger.error(`Failed to post message: ${err.message}`);
+    }
+  }
+
+  // Curse broadcast — independent of tilt/promotion messages. Cursers ping the
+  // target only (not each other), and a win shatters every active curse on
+  // this player.
+  const cursers = player.cursers ?? [];
+  if (cursers.length > 0 && !silent) {
+    const curserMentions = cursers.map((c) => `<@${c.curserDiscordId}>`);
+    const curseText = won
+      ? buildCurseBrokenMessage(displayToken, curserMentions)
+      : buildCurseLossMessage(displayToken, curserMentions);
+    const targetMentions = player.discordUserId ? [player.discordUserId] : [];
+
+    try {
+      await channel.send({
+        content: curseText,
+        allowedMentions: targetMentions.length > 0
+          ? { users: targetMentions }
+          : { parse: [] },
+      });
+    } catch (err) {
+      logger.error(`Failed to post curse message: ${err.message}`);
+    }
+
+    if (won) {
+      await storage.updatePlayer(player.puuid, { cursers: [] });
     }
   }
 }
