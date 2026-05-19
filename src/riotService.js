@@ -155,6 +155,7 @@ export function extractMatchSummary(match, puuid) {
     championName: p.championName ?? 'Unknown',
     queueId: match.info?.queueId ?? null,
     gameStartTimestamp: match.info?.gameStartTimestamp ?? null,
+    gameEndTimestamp: match.info?.gameEndTimestamp ?? null,
     gameDuration: match.info?.gameDuration ?? null,
     totalDamageDealtToChampions: playerDamage,
     damageShare,

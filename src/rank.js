@@ -159,10 +159,12 @@ export function nextStreak(prev, won) {
 }
 
 /**
- * Compute today's record after one match, resetting on UTC date change.
+ * Compute today's record after one match, resetting when the local date in
+ * `tz` changes. UTC was wrong here for any non-UTC user — a late-night game
+ * crossing UTC midnight would split the day in half.
  */
-export function nextToday(prev, won) {
-  const today = utcDateKey();
+export function nextToday(prev, won, tz) {
+  const today = dateKey(tz);
   const base = prev?.date === today ? prev : { date: today, wins: 0, losses: 0, lpDelta: 0 };
   return {
     date: today,
@@ -173,17 +175,79 @@ export function nextToday(prev, won) {
 }
 
 /**
- * Current UTC date in YYYY-MM-DD form. Used as the bucket key for today's record.
+ * Format a date (or now) as YYYY-MM-DD in the given IANA timezone.
+ * en-CA happens to use the ISO date format natively, which is convenient.
  */
-export function utcDateKey(date = new Date()) {
-  return date.toISOString().slice(0, 10);
+export function dateKey(tz, date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
 }
 
 /**
- * UTC date (YYYY-MM-DD) of an epoch-millisecond timestamp. Returns null when
- * the input isn't a valid number — caller decides how to handle missing data.
+ * Local date (YYYY-MM-DD) of an epoch-millisecond timestamp in the given tz.
+ * Returns null when the input isn't a valid number — caller decides what to do.
  */
-export function dateKeyForTimestamp(epochMs) {
+export function dateKeyForTimestamp(epochMs, tz) {
   if (!Number.isFinite(epochMs)) return null;
-  return new Date(epochMs).toISOString().slice(0, 10);
+  return dateKey(tz, new Date(epochMs));
+}
+
+/**
+ * Find the next epoch instant where the wall-clock time in `tz` is 23:59:00.
+ * Iterative refinement converges in 1-2 steps; up to 3 are allowed for DST
+ * forward/back edge cases (the target itself, 23:59, never lands on a DST
+ * transition in any IANA zone — those happen at 2am or 3am local).
+ */
+export function nextLocalEodInstant(now, tz) {
+  const dateFmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+
+  function partsAt(epoch) {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    });
+    return Object.fromEntries(fmt.formatToParts(new Date(epoch)).map((p) => [p.type, p.value]));
+  }
+
+  function epochForLocal(y, m, d) {
+    // Solve for the UTC epoch whose wall-clock time in `tz` is (y, m, d, 23, 59, 00).
+    // Start with the naive value (pretending tz=UTC), then iterate.
+    let guess = Date.UTC(y, m - 1, d, 23, 59, 0);
+    for (let i = 0; i < 3; i++) {
+      const p = partsAt(guess);
+      const got = Date.UTC(
+        Number(p.year), Number(p.month) - 1, Number(p.day),
+        Number(p.hour), Number(p.minute), Number(p.second),
+      );
+      const want = Date.UTC(y, m - 1, d, 23, 59, 0);
+      const drift = want - got;
+      if (drift === 0) break;
+      guess += drift;
+    }
+    return guess;
+  }
+
+  // Today's local date in tz.
+  const todayParts = Object.fromEntries(
+    dateFmt.formatToParts(new Date(now)).map((p) => [p.type, p.value]),
+  );
+  const y = Number(todayParts.year);
+  const m = Number(todayParts.month);
+  const d = Number(todayParts.day);
+
+  // Today's 23:59. If we're already past it, target tomorrow's 23:59.
+  let candidate = epochForLocal(y, m, d);
+  if (candidate <= now) candidate = epochForLocal(y, m, d + 1); // Date.UTC handles month-overflow
+  return candidate;
 }

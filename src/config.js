@@ -63,6 +63,18 @@ if (!Number.isFinite(pollIntervalMs) || pollIntervalMs < 10_000) {
   throw new Error('POLL_INTERVAL_MS must be a number >= 10000 (10 seconds)');
 }
 
+// IANA timezone used for the "today" boundary, end-of-day report scheduling,
+// and the stale-match guard. UTC was wrong for anyone east or west of zero
+// because games crossing UTC midnight got dropped as "historical".
+const timezone = readOptional('BOT_TIMEZONE', 'America/Chicago');
+try {
+  new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+} catch {
+  throw new Error(
+    `BOT_TIMEZONE "${timezone}" is not a valid IANA timezone (e.g. America/New_York, America/Chicago, Europe/London)`,
+  );
+}
+
 export const config = Object.freeze({
   discord: {
     token: readRequired('DISCORD_TOKEN'),
@@ -76,4 +88,5 @@ export const config = Object.freeze({
     platformRouting: platformRouting,
   },
   pollIntervalMs,
+  timezone,
 });

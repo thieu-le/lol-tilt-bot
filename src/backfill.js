@@ -1,12 +1,13 @@
 // Backfill today's ranked matches when a player is first added to tracking.
 // Called once from /track add. Processes any ranked games that finished today
-// (UTC) before the bot started watching, updating streak/wins/losses/rank in
-// storage without sending any Discord notifications.
+// (in the configured local timezone) before the bot started watching, updating
+// streak/wins/losses/rank in storage without sending any Discord notifications.
 
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import * as rank from './rank.js';
 import { nextStreak, nextToday } from './rank.js';
+import { config } from './config.js';
 import { logger } from './logger.js';
 
 // Fetch up to this many recent ranked IDs. Most players play <15 ranked games/day.
@@ -16,7 +17,7 @@ export async function backfillTodayMatches(puuid) {
   const player = storage.findByPuuid(puuid);
   if (!player) return 0;
 
-  const todayKey = rank.utcDateKey();
+  const todayKey = rank.dateKey(config.timezone);
 
   const ids = await riot.getRecentMatchIds(puuid, MAX_BACKFILL_MATCHES, { type: 'ranked' });
   if (!ids.length) return 0;
@@ -34,7 +35,7 @@ export async function backfillTodayMatches(puuid) {
     if (!summary) continue;
 
     const { gameEndTimestamp, gameStartTimestamp } = summary;
-    const matchDate = rank.dateKeyForTimestamp(gameEndTimestamp ?? gameStartTimestamp);
+    const matchDate = rank.dateKeyForTimestamp(gameEndTimestamp ?? gameStartTimestamp, config.timezone);
 
     if (matchDate !== todayKey) break;
     todayMatches.push(summary);
@@ -48,7 +49,7 @@ export async function backfillTodayMatches(puuid) {
   for (const summary of todayMatches) {
     const { won } = summary;
     streak = nextStreak(streak, won);
-    today = nextToday(today, won);
+    today = nextToday(today, won, config.timezone);
     wins += won ? 1 : 0;
     losses += won ? 0 : 1;
   }

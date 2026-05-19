@@ -78,8 +78,8 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   // Stale-match guard: matches from previous UTC days update no counters and
   // send no notifications. Prevents old games from warping today's record when
   // the bot was offline overnight.
-  const matchDate = rank.dateKeyForTimestamp(gameEndTimestamp ?? gameStartTimestamp);
-  const todayKey = rank.utcDateKey();
+  const matchDate = rank.dateKeyForTimestamp(gameEndTimestamp ?? gameStartTimestamp, config.timezone);
+  const todayKey = rank.dateKey(config.timezone);
   if (matchDate && matchDate !== todayKey) {
     logger.info(
       `Match ${matchId} for ${player.riotId.gameName}#${player.riotId.tagLine} ended ${matchDate} (not today ${todayKey}) — historical, no notification`,
@@ -89,7 +89,7 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   }
 
   const newStreak = nextStreak(player.streak, won);
-  const newToday = nextToday(player.today, won);
+  const newToday = nextToday(player.today, won, config.timezone);
 
   let lpDeltaStr = null;
   let rankLabel = null;
@@ -256,7 +256,7 @@ async function processPlayer(player, channel, { startup = false } = {}) {
   const post = storage.findByPuuid(player.puuid);
 
   // Only include in the report if at least one game was processed for today.
-  const todayKey = rank.utcDateKey();
+  const todayKey = rank.dateKey(config.timezone);
   if (post.today?.date !== todayKey) return null;
 
   const rankLabel = post.lastRank ? rank.formatRank(post.lastRank) : null;
@@ -298,7 +298,7 @@ async function postStartupReport(channel, summaries) {
 
 async function postEndOfDayReport(channel) {
   const players = storage.getPlayers();
-  const todayKey = rank.utcDateKey();
+  const todayKey = rank.dateKey(config.timezone);
 
   // If nobody played ranked today at all, stay silent.
   const playedToday = players.filter((p) => p.today?.date === todayKey);
@@ -352,18 +352,10 @@ async function postEndOfDayReport(channel) {
 
 function scheduleEndOfDayReport(channel) {
   const now = Date.now();
-  // Next UTC midnight, minus 1 minute → 23:59 UTC.
-  const d = new Date();
-  const nextMidnightUTC = Date.UTC(
-    d.getUTCFullYear(),
-    d.getUTCMonth(),
-    d.getUTCDate() + 1,
-  );
-  // If we're already inside the 23:59 minute (or rescheduling right after
-  // firing), nextMidnightUTC - 60_000 resolves to a moment <= now and the
-  // setTimeout would fire immediately, looping for ~60s. Push forward 24h.
-  let triggerAt = nextMidnightUTC - 60_000;
-  if (triggerAt <= now) triggerAt += 24 * 60 * 60 * 1000;
+  // Fire at 23:59 LOCAL time in the configured timezone, not 23:59 UTC.
+  // nextLocalEodInstant guarantees the result is > now, so no setTimeout(0)
+  // loop is possible even if we're rescheduling right after firing.
+  const triggerAt = rank.nextLocalEodInstant(now, config.timezone);
   const delay = triggerAt - now;
 
   setTimeout(async () => {
