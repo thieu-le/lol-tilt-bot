@@ -122,34 +122,145 @@ function formatCurserList(curserMentions) {
 }
 
 /**
- * Channel announcement when /curse is applied. `count` is the post-append size
- * of the cursers array (1 = first curser, 2+ = stacking).
+ * Map a recent-results array (W/L outcomes) into a Tilted Souls payout
+ * multiplier. Higher win rate = harder curse = bigger reward when it lands.
  */
-export function buildCurseAppliedMessage(targetMention, curserMention, count) {
-  if (count <= 1) {
-    return `${targetMention}, you've been cursed to suffer through LosersQ by ${curserMention}. Win a game to break LosersQ. 🪦`;
-  }
-  return `${curserMention} has joined the curse on ${targetMention}.\n${targetMention} is now cursed by ${count} players. Win a game to break LosersQ. 🪦`;
+export function computePayoutMultiplier(recentResults) {
+  if (!recentResults || recentResults.length === 0) return 1.0; // no data → base
+  const wins = recentResults.filter((r) => r === 'W').length;
+  const wr = wins / recentResults.length;
+  if (wr >= 0.80) return 3.0;  // gambler's dream
+  if (wr >= 0.60) return 2.0;
+  if (wr >= 0.40) return 1.0;  // base
+  if (wr >= 0.20) return 0.5;
+  return 0.25;                  // cursing a known troll — minimal reward
 }
 
 /**
- * Channel announcement when a cursed player wins and breaks the curse.
+ * "Recent form: 12W-8L (60% wr → 2.0x payout)" footer used on curse-applied
+ * messages so the curser sees their odds.
+ */
+function formatCurseOddsLine(recentResults, multiplier) {
+  if (!recentResults || recentResults.length === 0) {
+    return `Recent form unknown — payout locked at ${multiplier.toFixed(1)}x.`;
+  }
+  const wins = recentResults.filter((r) => r === 'W').length;
+  const losses = recentResults.length - wins;
+  const wrPct = Math.round((wins / recentResults.length) * 100);
+  return `Recent form: ${wins}W-${losses}L (${wrPct}% wr → ${multiplier.toFixed(1)}x payout).`;
+}
+
+/**
+ * Channel announcement when /curse is applied. `count` is the post-append size
+ * of the cursers array (1 = first curser, 2+ = stacking).
+ *
+ * `opts.recentResults` and `opts.payoutMultiplier` drive the odds footer. Both
+ * are stored on the curser entry at curse time so the multiplier is locked.
+ */
+export function buildCurseAppliedMessage(targetMention, curserMention, count, opts = {}) {
+  const oddsLine = formatCurseOddsLine(opts.recentResults, opts.payoutMultiplier ?? 1.0);
+  if (count <= 1) {
+    return `${targetMention}, you've been cursed to suffer through LosersQ by ${curserMention}.\n${oddsLine} Win a game to break LosersQ. 🪦`;
+  }
+  return `${curserMention} has joined the curse on ${targetMention}.\n${targetMention} is now cursed by ${count} players. ${oddsLine} 🪦`;
+}
+
+/**
+ * Channel announcement when a cursed player wins and breaks the curse. No
+ * payouts on a break — cursers come up empty.
  */
 export function buildCurseBrokenMessage(targetMention, curserMentions) {
   if (curserMentions.length === 1) {
-    return `${targetMention} has broken LosersQ. ${curserMentions[0]}'s curse is shattered. 🎉`;
+    return `${targetMention} has broken LosersQ. ${curserMentions[0]}'s curse is shattered. 🎉\n(No souls awarded — the curser came up empty.)`;
   }
-  return `${targetMention} has broken LosersQ. Freed from: ${formatCurserList(curserMentions)}. 🎉`;
+  return `${targetMention} has broken LosersQ. Freed from: ${formatCurserList(curserMentions)}. 🎉\n(No souls awarded — the cursers came up empty.)`;
 }
 
 /**
- * Channel announcement when a cursed player loses and the curse holds.
+ * Channel announcement when a cursed player loses. `awards` is the per-curser
+ * payout record after `lossesAccrued` has been incremented for this match:
+ *   [{ mention, payout, balance }, ...]
+ *
+ * Single-curser format goes inline; multi-curser format goes vertical.
  */
-export function buildCurseLossMessage(targetMention, curserMentions) {
-  if (curserMentions.length === 1) {
-    return `${curserMentions[0]} has doomed ${targetMention} to LosersQ. 🪦`;
+export function buildCurseLossMessage(targetMention, awards) {
+  if (awards.length === 1) {
+    const a = awards[0];
+    return `${a.mention} has doomed ${targetMention} to LosersQ — +${a.payout} souls (balance: ${a.balance}). 🪦`;
   }
-  return `${targetMention} has been doomed to LosersQ by ${formatCurserList(curserMentions)}. 🪦`;
+  const lines = awards.map(
+    (a) => `  • ${a.mention} +${a.payout} souls (balance: ${a.balance})`,
+  );
+  return `${targetMention} has been doomed to LosersQ by:\n${lines.join('\n')}\n🪦`;
+}
+
+// --- Fraud Watch ----------------------------------------------------------
+
+/**
+ * 0-100 "undeserved win" score. Returns null on losses or when essential
+ * inputs are missing — caller should treat null as "no fraud signal".
+ *
+ * Composite of four signals capped at 100:
+ *   - damage share (max 30)
+ *   - kill participation (max 30)
+ *   - KDA (max 25)
+ *   - turret damage share (max 15)
+ */
+export function computeFraudScore({
+  won,
+  kills,
+  deaths,
+  assists,
+  damageShare,
+  killParticipation,
+  turretDamageShare,
+} = {}) {
+  if (!won) return null;
+  if (!Number.isFinite(kills) || !Number.isFinite(deaths) || !Number.isFinite(assists)) {
+    return null;
+  }
+
+  let score = 0;
+
+  if (damageShare !== null && damageShare !== undefined) {
+    if (damageShare < 0.08)      score += 30;
+    else if (damageShare < 0.12) score += 22;
+    else if (damageShare < 0.16) score += 12;
+    else if (damageShare < 0.20) score += 5;
+  }
+
+  if (killParticipation !== null && killParticipation !== undefined) {
+    if (killParticipation < 0.20)      score += 30;
+    else if (killParticipation < 0.30) score += 20;
+    else if (killParticipation < 0.40) score += 10;
+  }
+
+  const kda = (kills + assists) / Math.max(deaths, 1);
+  if (kda < 0.5)      score += 25;
+  else if (kda < 1.0) score += 15;
+  else if (kda < 1.5) score += 5;
+
+  if (turretDamageShare !== null && turretDamageShare !== undefined) {
+    if (turretDamageShare < 0.03)      score += 15;
+    else if (turretDamageShare < 0.08) score += 7;
+  }
+
+  return Math.min(100, score);
+}
+
+/**
+ * Build the 🚨 FRAUD WATCH 🚨 channel message for a win that crossed the
+ * fraud threshold. Includes the score and the underlying stats so the chat
+ * can roast them with evidence.
+ */
+export function buildFraudWatchMessage(displayToken, fraudScore, summary) {
+  const { kills, deaths, assists, damageShare, killParticipation, turretDamageShare } = summary;
+  const kda = `${kills}/${deaths}/${assists}`;
+  const stats = [kda];
+  if (Number.isFinite(damageShare)) stats.push(`${Math.round(damageShare * 100)}% dmg`);
+  if (Number.isFinite(killParticipation)) stats.push(`${Math.round(killParticipation * 100)}% KP`);
+  if (Number.isFinite(turretDamageShare)) stats.push(`${Math.round(turretDamageShare * 100)}% turret dmg`);
+  return `🚨 FRAUD WATCH 🚨\n${displayToken} got carried this game — Fraud Score: ${fraudScore}%\n${stats.join(' • ')}`;
 }
 
 /**

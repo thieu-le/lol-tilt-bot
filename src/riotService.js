@@ -135,16 +135,31 @@ export function extractMatchSummary(match, puuid) {
   const p = match?.info?.participants?.find((x) => x.puuid === puuid);
   if (!p) return null;
 
-  // Damage share = this player's champ-damage / their team's total champ-damage.
-  // Used by the tilt meter to weight "carry vs. AFK" beyond raw KDA.
+  // Team-relative stats — used by the tilt meter and the Fraud Watch tracker.
+  // All "share" values are 0..1 (player contribution / team total), or null
+  // when the team total is 0 (pathological match payload).
   const participants = match.info?.participants ?? [];
   const sameTeam = participants.filter((x) => x.teamId === p.teamId);
+
   const teamDamage = sameTeam.reduce(
     (sum, x) => sum + (x.totalDamageDealtToChampions ?? 0),
     0,
   );
   const playerDamage = p.totalDamageDealtToChampions ?? 0;
   const damageShare = teamDamage > 0 ? playerDamage / teamDamage : null;
+
+  const teamKills = sameTeam.reduce((sum, x) => sum + (x.kills ?? 0), 0);
+  const killParticipation = teamKills > 0
+    ? ((p.kills ?? 0) + (p.assists ?? 0)) / teamKills
+    : null;
+
+  const teamTurretDmg = sameTeam.reduce(
+    (sum, x) => sum + (x.damageDealtToTurrets ?? 0),
+    0,
+  );
+  const turretDamageShare = teamTurretDmg > 0
+    ? (p.damageDealtToTurrets ?? 0) / teamTurretDmg
+    : null;
 
   return {
     matchId: match.metadata?.matchId ?? null,
@@ -159,6 +174,8 @@ export function extractMatchSummary(match, puuid) {
     gameDuration: match.info?.gameDuration ?? null,
     totalDamageDealtToChampions: playerDamage,
     damageShare,
+    killParticipation,
+    turretDamageShare,
   };
 }
 

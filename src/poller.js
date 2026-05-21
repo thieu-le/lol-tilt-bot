@@ -23,6 +23,8 @@ import {
   computeTiltMeter,
   buildCurseBrokenMessage,
   buildCurseLossMessage,
+  computeFraudScore,
+  buildFraudWatchMessage,
 } from './messages.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
@@ -65,6 +67,8 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     gameEndTimestamp,
     gameStartTimestamp,
     damageShare,
+    killParticipation,
+    turretDamageShare,
   } = summary;
 
   if (!rank.isRankedQueue(queueId)) {
@@ -113,6 +117,10 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     logger.warn(`Failed to fetch ranked entries for ${player.puuid}: ${err.message}`);
   }
 
+  // Rolling 20-match outcome window powers the souls payout multiplier.
+  // Trimmed by slice(-20) so it never grows past the cap.
+  const newRecentResults = [...(player.recentResults ?? []), won ? 'W' : 'L'].slice(-20);
+
   await storage.updatePlayer(player.puuid, {
     lastProcessedMatchId: matchId,
     streak: newStreak,
@@ -120,6 +128,7 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     lastRank: newLastRank,
     wins: player.wins + (won ? 1 : 0),
     losses: player.losses + (won ? 0 : 1),
+    recentResults: newRecentResults,
   });
 
   logger.info(
@@ -174,17 +183,61 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     }
   }
 
+  // Fraud Watch — independent of the standard win message. Only fires when a
+  // win is statistically suspicious (low damage share, low KP, bad KDA, etc.).
+  if (!silent && won) {
+    const fraudScore = computeFraudScore({
+      won,
+      kills,
+      deaths,
+      assists,
+      damageShare,
+      killParticipation,
+      turretDamageShare,
+    });
+    if (Number.isFinite(fraudScore) && fraudScore >= 50) {
+      try {
+        await channel.send({
+          content: buildFraudWatchMessage(displayToken, fraudScore, summary),
+          allowedMentions: { parse: [] },
+        });
+      } catch (err) {
+        logger.error(`Failed to post fraud watch message: ${err.message}`);
+      }
+    }
+  }
+
   // Curse broadcast — independent of tilt/promotion messages. Cursers ping the
-  // target only (not each other), and a win shatters every active curse on
-  // this player.
+  // target only (not each other). A win shatters every active curse on this
+  // player. A loss awards souls per curser (base 100 × 2^lossesAccrued ×
+  // payoutMultiplier) and increments each curser's lossesAccrued counter.
   const cursers = player.cursers ?? [];
   if (cursers.length > 0 && !silent) {
-    const curserMentions = cursers.map((c) => `<@${c.curserDiscordId}>`);
-    const curseText = won
-      ? buildCurseBrokenMessage(displayToken, curserMentions)
-      : buildCurseLossMessage(displayToken, curserMentions);
-    const targetMentions = player.discordUserId ? [player.discordUserId] : [];
+    let curseText;
 
+    if (won) {
+      const curserMentions = cursers.map((c) => `<@${c.curserDiscordId}>`);
+      curseText = buildCurseBrokenMessage(displayToken, curserMentions);
+    } else {
+      const updatedCursers = [];
+      const awards = [];
+      for (const c of cursers) {
+        const lossesAccrued = c.lossesAccrued ?? 0;
+        const multiplier = c.payoutMultiplier ?? 1.0;
+        const payout = Math.round(100 * Math.pow(2, lossesAccrued) * multiplier);
+        const next = await storage.awardSouls(c.curserDiscordId, payout);
+        awards.push({
+          mention: `<@${c.curserDiscordId}>`,
+          payout,
+          balance: next.balance,
+        });
+        updatedCursers.push({ ...c, lossesAccrued: lossesAccrued + 1 });
+      }
+      await storage.updatePlayer(player.puuid, { cursers: updatedCursers });
+      curseText = buildCurseLossMessage(displayToken, awards);
+    }
+
+    const targetMentions = player.discordUserId ? [player.discordUserId] : [];
     try {
       await channel.send({
         content: curseText,

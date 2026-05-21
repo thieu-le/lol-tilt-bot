@@ -17,7 +17,10 @@ const DATA_DIR = path.resolve(__dirname, '..', 'data');
 const STORE_PATH = path.join(DATA_DIR, 'store.json');
 
 // Default DB shape — written on first boot.
-const defaultData = { players: [] };
+// `souls` is keyed by Discord user ID → { balance, totalEarned }. It lives at
+// the top level because curse payouts go to Discord users, not tracked players
+// (the curser may not be a tracked LoL player).
+const defaultData = { players: [], souls: {} };
 
 let db = null;
 
@@ -31,6 +34,11 @@ export async function init() {
   // JSONFilePreset already loads on creation; this `read` is belt-and-braces.
   await db.read();
   db.data ||= structuredClone(defaultData);
+  // Fill in any new top-level collections introduced after the file was first
+  // written. Without this, an older store.json would be missing `souls` and
+  // every getSouls call would NPE.
+  db.data.players ||= [];
+  db.data.souls ||= {};
   await db.write();
 }
 
@@ -91,6 +99,9 @@ export async function addPlayer(player) {
     today: player.today ?? { date: null, wins: 0, losses: 0 },
     lastRank: player.lastRank ?? null,
     cursers: player.cursers ?? [],
+    // Rolling window of the last 20 ranked match outcomes ('W' | 'L'), oldest
+    // first. Used by the souls payout multiplier to gauge "recent form".
+    recentResults: player.recentResults ?? [],
     addedAt: player.addedAt ?? new Date().toISOString(),
   });
   await db.write();
@@ -106,6 +117,58 @@ export async function removePlayer(puuid) {
   const removed = db.data.players.length !== before;
   if (removed) await db.write();
   return removed;
+}
+
+// --- Souls (Discord-user currency) -----------------------------------------
+
+/**
+ * Read a Discord user's soul balance. Returns the default zero record for
+ * users who have never received souls.
+ */
+export function getSouls(discordUserId) {
+  ensureReady();
+  const entry = db.data.souls?.[discordUserId];
+  if (!entry) return { balance: 0, totalEarned: 0 };
+  return { ...entry };
+}
+
+/**
+ * Credit a Discord user with `amount` souls. Updates both `balance` and the
+ * lifetime `totalEarned` counter. Negative or zero amounts are no-ops.
+ * Returns the new record.
+ */
+export async function awardSouls(discordUserId, amount) {
+  ensureReady();
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return getSouls(discordUserId);
+  }
+  db.data.souls ||= {};
+  const prev = db.data.souls[discordUserId] ?? { balance: 0, totalEarned: 0 };
+  const next = {
+    balance: prev.balance + amount,
+    totalEarned: prev.totalEarned + amount,
+  };
+  db.data.souls[discordUserId] = next;
+  await db.write();
+  return { ...next };
+}
+
+/**
+ * Top-N souls leaderboard by current balance. Returns an array of
+ * `{ discordUserId, balance, totalEarned }` sorted descending. Users with zero
+ * balance are excluded.
+ */
+export function getSoulsLeaderboard(limit = 10) {
+  ensureReady();
+  const entries = Object.entries(db.data.souls ?? {})
+    .map(([discordUserId, v]) => ({
+      discordUserId,
+      balance: v.balance ?? 0,
+      totalEarned: v.totalEarned ?? 0,
+    }))
+    .filter((e) => e.balance > 0)
+    .sort((a, b) => b.balance - a.balance);
+  return entries.slice(0, limit);
 }
 
 /**

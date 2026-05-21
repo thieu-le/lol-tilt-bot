@@ -8,7 +8,7 @@ import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import { backfillTodayMatches } from './backfill.js';
-import { buildCurseAppliedMessage } from './messages.js';
+import { buildCurseAppliedMessage, computePayoutMultiplier } from './messages.js';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -97,12 +97,31 @@ const uncurseCommand = new SlashCommandBuilder()
     opt.setName('tagline').setDescription('Riot ID tag line').setRequired(true),
   );
 
+const soulsCommand = new SlashCommandBuilder()
+  .setName('souls')
+  .setDescription('Tilted Souls — currency earned from successful curses')
+  .addSubcommand((sub) =>
+    sub
+      .setName('balance')
+      .setDescription('Check your (or another tracked player\'s) soul balance')
+      .addStringOption((opt) =>
+        opt.setName('gamename').setDescription('Tracked player\'s Riot game name (optional)').setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt.setName('tagline').setDescription('Tracked player\'s Riot tag line (optional)').setRequired(false),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub.setName('leaderboard').setDescription('Show the top 10 soul-holders in the server'),
+  );
+
 export const commandData = [
   trackCommand.toJSON(),
   streakCommand.toJSON(),
   historyCommand.toJSON(),
   curseCommand.toJSON(),
   uncurseCommand.toJSON(),
+  soulsCommand.toJSON(),
 ];
 
 // Most common Riot queue IDs — anything not in here falls back to "Queue {id}".
@@ -325,12 +344,23 @@ async function handleCurse(interaction) {
     return;
   }
 
+  // Lock the payout odds at curse time, Twitch-Predictions style. The target
+  // can go on a heater later — your multiplier stays at what it was when you
+  // committed.
+  const recentResults = target.recentResults ?? [];
+  const payoutMultiplier = computePayoutMultiplier(recentResults);
+  const wins = recentResults.filter((r) => r === 'W').length;
+  const recentWinRate = recentResults.length > 0 ? wins / recentResults.length : null;
+
   const next = [
     ...existing,
     {
       curserDiscordId,
       curserDisplayName: interaction.user.username,
       cursedAt: new Date().toISOString(),
+      payoutMultiplier,
+      recentWinRate,
+      lossesAccrued: 0,
     },
   ];
   await storage.updatePlayer(target.puuid, { cursers: next });
@@ -344,7 +374,10 @@ async function handleCurse(interaction) {
   try {
     const channel = await interaction.client.channels.fetch(config.discord.channelId);
     await channel.send({
-      content: buildCurseAppliedMessage(targetMention, curserMention, next.length),
+      content: buildCurseAppliedMessage(targetMention, curserMention, next.length, {
+        recentResults,
+        payoutMultiplier,
+      }),
       allowedMentions:
         targetMentionIds.length > 0 ? { users: targetMentionIds } : { parse: [] },
     });
@@ -353,7 +386,7 @@ async function handleCurse(interaction) {
   }
 
   await interaction.editReply(
-    `Curse applied to **${target.riotId.gameName}#${target.riotId.tagLine}** — now cursed by ${next.length} player(s). 🪦`,
+    `Curse applied to **${target.riotId.gameName}#${target.riotId.tagLine}** at ${payoutMultiplier.toFixed(1)}x payout — now cursed by ${next.length} player(s). 🪦`,
   );
 }
 
@@ -389,6 +422,83 @@ async function handleUncurse(interaction) {
       `Your curse on **${target.riotId.gameName}#${target.riotId.tagLine}** is lifted. Still cursed by ${filtered.length} other player(s).`,
     );
   }
+}
+
+async function handleSoulsBalance(interaction) {
+  const gameName = interaction.options.getString('gamename');
+  const tagLine = interaction.options.getString('tagline');
+
+  if ((gameName && !tagLine) || (!gameName && tagLine)) {
+    await interaction.editReply(
+      'Provide both `gamename` and `tagline` to look up another player, or neither to see your own balance.',
+    );
+    return;
+  }
+
+  let targetUserId;
+  let label;
+
+  if (gameName && tagLine) {
+    const target = storage.findByRiotId(gameName, tagLine);
+    if (!target) {
+      await interaction.editReply(`Not tracking **${gameName}#${tagLine}**.`);
+      return;
+    }
+    if (!target.discordUserId) {
+      await interaction.editReply(
+        `**${target.riotId.gameName}#${target.riotId.tagLine}** isn't linked to a Discord user — they can't hold souls.`,
+      );
+      return;
+    }
+    targetUserId = target.discordUserId;
+    label = `<@${targetUserId}>`;
+  } else {
+    targetUserId = interaction.user.id;
+    label = 'You';
+  }
+
+  const souls = storage.getSouls(targetUserId);
+  await interaction.editReply({
+    content: `${label} have **${souls.balance.toLocaleString()}** Tilted Souls 🪦 (lifetime: ${souls.totalEarned.toLocaleString()}).`,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleSoulsLeaderboard(interaction) {
+  const top = storage.getSoulsLeaderboard(10);
+  if (top.length === 0) {
+    await interaction.editReply('Nobody has earned souls yet. Cast the first curse with `/curse`.');
+    return;
+  }
+
+  const lines = top.map((entry, i) => {
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+    return `${medal} <@${entry.discordUserId}> — **${entry.balance.toLocaleString()}** souls (lifetime: ${entry.totalEarned.toLocaleString()})`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle('🪦 Tilted Souls Leaderboard')
+    .setColor(0x5865f2)
+    .setDescription(lines.join('\n'));
+
+  // Post publicly to the configured tilt channel so the whole group sees it,
+  // then ephemeral-ack the invoker. Same pattern as /curse.
+  try {
+    const channel = await interaction.client.channels.fetch(config.discord.channelId);
+    await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  } catch (err) {
+    logger.error(`Failed to post souls leaderboard: ${err.message}`);
+    await interaction.editReply('Failed to post the leaderboard to the channel.');
+    return;
+  }
+  await interaction.editReply('Leaderboard posted. 🪦');
+}
+
+async function handleSouls(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'balance') return handleSoulsBalance(interaction);
+  if (sub === 'leaderboard') return handleSoulsLeaderboard(interaction);
+  await interaction.editReply(`Unknown /souls subcommand: ${sub}`);
 }
 
 async function handleStreak(interaction) {
@@ -434,6 +544,9 @@ export async function handleInteraction(interaction) {
     }
     if (interaction.commandName === 'uncurse') {
       return await handleUncurse(interaction);
+    }
+    if (interaction.commandName === 'souls') {
+      return await handleSouls(interaction);
     }
     await interaction.editReply(`Unknown command: ${interaction.commandName}`);
   } catch (err) {
