@@ -4,11 +4,25 @@
 // can register them with Discord, and `handleInteraction()` so bot.js can
 // dispatch incoming interactions to the right handler.
 
-import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
+import {
+  SlashCommandBuilder,
+  EmbedBuilder,
+  MessageFlags,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} from 'discord.js';
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import { backfillTodayMatches } from './backfill.js';
-import { buildCurseAppliedMessage, computePayoutMultiplier } from './messages.js';
+import {
+  buildCurseAppliedMessage,
+  computePayoutMultiplier,
+  buildBetPoolMessage,
+} from './messages.js';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -97,6 +111,13 @@ const uncurseCommand = new SlashCommandBuilder()
     opt.setName('tagline').setDescription('Riot ID tag line').setRequired(true),
   );
 
+const betCommand = new SlashCommandBuilder()
+  .setName('bet')
+  .setDescription('Live prediction pools — auto-opened when a tracked player enters ranked')
+  .addSubcommand((sub) =>
+    sub.setName('status').setDescription('List active or pending prediction pools'),
+  );
+
 const soulsCommand = new SlashCommandBuilder()
   .setName('souls')
   .setDescription('Tilted Souls — currency earned from successful curses')
@@ -122,7 +143,29 @@ export const commandData = [
   curseCommand.toJSON(),
   uncurseCommand.toJSON(),
   soulsCommand.toJSON(),
+  betCommand.toJSON(),
 ];
+
+// --- Bet UI helpers (used by poller too) -----------------------------------
+
+/**
+ * Build the two-button row attached to a live prediction message.
+ * customId format: `bet:stake:{gameId}:{side}` so the click handler can parse
+ * out the gameId without any extra state lookup.
+ */
+export function buildStakeButtons(gameId) {
+  const winBtn = new ButtonBuilder()
+    .setCustomId(`bet:stake:${gameId}:win`)
+    .setLabel('Bet WIN')
+    .setEmoji('✅')
+    .setStyle(ButtonStyle.Success);
+  const lossBtn = new ButtonBuilder()
+    .setCustomId(`bet:stake:${gameId}:loss`)
+    .setLabel('Bet LOSS')
+    .setEmoji('❌')
+    .setStyle(ButtonStyle.Danger);
+  return new ActionRowBuilder().addComponents(winBtn, lossBtn);
+}
 
 // Most common Riot queue IDs — anything not in here falls back to "Queue {id}".
 // Full reference: https://static.developer.riotgames.com/docs/lol/queues.json
@@ -501,6 +544,137 @@ async function handleSouls(interaction) {
   await interaction.editReply(`Unknown /souls subcommand: ${sub}`);
 }
 
+async function handleBetStatus(interaction) {
+  const bets = storage.getBetsByStatus('open', 'awaiting_resolve');
+  if (bets.length === 0) {
+    await interaction.editReply(
+      'No active prediction pools right now. Bets auto-open when a tracked player enters a ranked game.',
+    );
+    return;
+  }
+  const lines = bets.map((b) => {
+    const target = b.targetDiscordId ? `<@${b.targetDiscordId}>` : `**${b.displayName}**`;
+    const total = (b.pools?.win ?? 0) + (b.pools?.loss ?? 0);
+    const tag = b.status === 'open' ? '🎲 open' : '🔒 locked (awaiting result)';
+    return `${target} — ${total.toLocaleString()} souls staked — ${tag}`;
+  });
+  await interaction.editReply({
+    content: lines.join('\n'),
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleBet(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'status') return handleBetStatus(interaction);
+  await interaction.editReply(`Unknown /bet subcommand: ${sub}`);
+}
+
+/**
+ * Button click on a bet message. customId = `bet:stake:{gameId}:{side}`.
+ * Opens a modal asking how many souls to stake.
+ */
+async function handleBetButton(interaction) {
+  const customId = interaction.customId ?? '';
+  if (!customId.startsWith('bet:stake:')) return;
+  const parts = customId.split(':');
+  const gameId = parts[2];
+  const side = parts[3];
+
+  const bet = storage.getBetByGameId(gameId);
+  if (!bet) {
+    await interaction.reply({
+      content: 'This prediction no longer exists.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (bet.status !== 'open') {
+    await interaction.reply({
+      content: 'Betting is closed on this prediction.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const userSouls = storage.getSouls(interaction.user.id);
+  const modal = new ModalBuilder()
+    .setCustomId(`bet:modal:${gameId}:${side}`)
+    .setTitle(`Bet ${side === 'win' ? 'WIN ✅' : 'LOSS ❌'}`);
+
+  const input = new TextInputBuilder()
+    .setCustomId('amount')
+    .setLabel(`Souls to stake (balance: ${userSouls.balance.toLocaleString()})`)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder('e.g. 500');
+
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  await interaction.showModal(modal);
+}
+
+/**
+ * Modal submit for placing a stake. customId = `bet:modal:{gameId}:{side}`.
+ * Deducts souls, records the stake, and refreshes the channel message.
+ */
+async function handleBetModal(interaction) {
+  const customId = interaction.customId ?? '';
+  if (!customId.startsWith('bet:modal:')) return;
+  const parts = customId.split(':');
+  const gameId = parts[2];
+  const side = parts[3];
+
+  const raw = interaction.fields.getTextInputValue('amount');
+  const amount = Number.parseInt(String(raw).replace(/[,_ ]/g, ''), 10);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await interaction.reply({
+      content: `"${raw}" isn't a valid positive number of souls.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const bet = storage.getBetByGameId(gameId);
+  if (!bet || bet.status !== 'open') {
+    await interaction.reply({
+      content: 'Betting is closed on this prediction.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const spend = await storage.spendSouls(interaction.user.id, amount);
+  if (!spend.ok) {
+    await interaction.reply({
+      content: `Not enough souls. You have ${spend.balance.toLocaleString()}, you tried to stake ${amount.toLocaleString()}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const updated = await storage.addStake(gameId, interaction.user.id, side, amount);
+
+  // Refresh the pool message so everyone sees the new odds.
+  if (updated.channelMessageId) {
+    try {
+      const channel = await interaction.client.channels.fetch(config.discord.channelId);
+      const msg = await channel.messages.fetch(updated.channelMessageId);
+      await msg.edit({
+        content: buildBetPoolMessage(updated),
+        components: [buildStakeButtons(gameId)],
+      });
+    } catch (err) {
+      logger.warn(`Failed to refresh bet pool message: ${err.message}`);
+    }
+  }
+
+  await interaction.reply({
+    content: `Staked ${amount.toLocaleString()} on ${side === 'win' ? '✅ WIN' : '❌ LOSS'}. Balance: ${spend.balance.toLocaleString()} souls.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 async function handleStreak(interaction) {
   const gameName = interaction.options.getString('gamename', true);
   const tagLine = interaction.options.getString('tagline', true);
@@ -517,42 +691,58 @@ async function handleStreak(interaction) {
 }
 
 /**
- * Top-level dispatcher invoked from bot.js for every slash interaction.
+ * Top-level dispatcher invoked from bot.js for every Discord interaction.
+ * Routes slash commands, button clicks, and modal submits separately because
+ * each has a different ack pattern (deferReply vs showModal vs reply).
  */
 export async function handleInteraction(interaction) {
-  if (!interaction.isChatInputCommand()) return;
-
-  // Defer immediately — we may do network work and the 3s ack window is tight.
-  // Use ephemeral so tracked-player chatter doesn't clutter the channel.
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
   try {
-    if (interaction.commandName === 'track') {
-      const sub = interaction.options.getSubcommand();
-      if (sub === 'add') return await handleTrackAdd(interaction);
-      if (sub === 'remove') return await handleTrackRemove(interaction);
-      if (sub === 'list') return await handleTrackList(interaction);
+    if (interaction.isChatInputCommand()) {
+      // Defer ephemeral so tracked-player chatter doesn't clutter the channel.
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      if (interaction.commandName === 'track') {
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'add') return await handleTrackAdd(interaction);
+        if (sub === 'remove') return await handleTrackRemove(interaction);
+        if (sub === 'list') return await handleTrackList(interaction);
+      }
+      if (interaction.commandName === 'streak') return await handleStreak(interaction);
+      if (interaction.commandName === 'history') return await handleHistory(interaction);
+      if (interaction.commandName === 'curse') return await handleCurse(interaction);
+      if (interaction.commandName === 'uncurse') return await handleUncurse(interaction);
+      if (interaction.commandName === 'souls') return await handleSouls(interaction);
+      if (interaction.commandName === 'bet') return await handleBet(interaction);
+      await interaction.editReply(`Unknown command: ${interaction.commandName}`);
+      return;
     }
-    if (interaction.commandName === 'streak') {
-      return await handleStreak(interaction);
+
+    if (interaction.isButton()) {
+      // Button click. showModal/reply are how we ack — do NOT deferReply.
+      if (interaction.customId?.startsWith('bet:stake:')) {
+        return await handleBetButton(interaction);
+      }
+      return;
     }
-    if (interaction.commandName === 'history') {
-      return await handleHistory(interaction);
+
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId?.startsWith('bet:modal:')) {
+        return await handleBetModal(interaction);
+      }
+      return;
     }
-    if (interaction.commandName === 'curse') {
-      return await handleCurse(interaction);
-    }
-    if (interaction.commandName === 'uncurse') {
-      return await handleUncurse(interaction);
-    }
-    if (interaction.commandName === 'souls') {
-      return await handleSouls(interaction);
-    }
-    await interaction.editReply(`Unknown command: ${interaction.commandName}`);
   } catch (err) {
-    logger.error(`Slash command failed: ${err.stack ?? err.message}`);
+    logger.error(`Interaction failed: ${err.stack ?? err.message}`);
     const detail = err.message ?? 'Unknown error';
-    // editReply works whether we deferred or replied — safer than reply().
-    await interaction.editReply(`Something broke: ${detail}`).catch(() => {});
+    // Best-effort error surface that works regardless of ack state.
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(`Something broke: ${detail}`);
+      } else {
+        await interaction.reply({ content: `Something broke: ${detail}`, flags: MessageFlags.Ephemeral });
+      }
+    } catch {
+      // give up — already noisy enough
+    }
   }
 }

@@ -194,6 +194,137 @@ export function buildCurseLossMessage(targetMention, awards) {
   return `${targetMention} has been doomed to LosersQ by:\n${lines.join('\n')}\n🪦`;
 }
 
+// --- Bets (live in-game prediction pools) ---------------------------------
+
+/**
+ * Render the live bet pool message. Same content is used for the initial post
+ * and every update as new stakes come in. Pool totals + a per-side payout
+ * multiplier let backers see odds shift in real time.
+ *
+ * Returns a string (the content). Caller attaches the buttons row separately.
+ */
+export function buildBetPoolMessage(bet, { locked = false } = {}) {
+  const winPool = bet.pools?.win ?? 0;
+  const lossPool = bet.pools?.loss ?? 0;
+  const totalPool = winPool + lossPool;
+  const stakes = bet.stakes ?? {};
+  const winBackers = Object.values(stakes).filter((s) => (s?.win ?? 0) > 0).length;
+  const lossBackers = Object.values(stakes).filter((s) => (s?.loss ?? 0) > 0).length;
+
+  function multiplierLine(side, sidePool, backers) {
+    if (sidePool === 0) {
+      return `${side} 0 souls • 0 backers • no takers yet`;
+    }
+    if (totalPool === sidePool) {
+      // Only one side has bets — payout would be refund-only.
+      return `${side} ${sidePool.toLocaleString()} souls • ${backers} backers • no opponents (refund only)`;
+    }
+    const mult = totalPool / sidePool;
+    return `${side} ${sidePool.toLocaleString()} souls • ${backers} backers • ${mult.toFixed(2)}x payout`;
+  }
+
+  const status = locked
+    ? '🔒 PREDICTION LOCKED — game ended, awaiting result'
+    : '🎲 PREDICTION OPEN';
+
+  const target = bet.targetDiscordId ? `<@${bet.targetDiscordId}>` : `**${bet.displayName}**`;
+  const callToBet = locked
+    ? 'No more bets — payouts settle when the match resolves.'
+    : 'Click a button to stake your Tilted Souls. Locks when the match ends.';
+
+  return [
+    status,
+    `${target} is live in ranked.`,
+    callToBet,
+    '',
+    multiplierLine('✅ WIN  ', winPool, winBackers),
+    multiplierLine('❌ LOSS ', lossPool, lossBackers),
+    '',
+    `Total pool: ${totalPool.toLocaleString()} souls`,
+  ].join('\n');
+}
+
+/**
+ * Twitch-Predictions-style proportional payout math.
+ *
+ * Returns `{ payouts: [{discordUserId, amount, kind}], totalPaid, refund }`.
+ *  - `kind: 'win'` — proportional cut of the total pool
+ *  - `kind: 'refund'` — stake-back when the winning side had no backers
+ *  - `refund: true` means all stakes go back to their original owners
+ */
+export function computeBetPayouts(bet, winningSide) {
+  if (winningSide !== 'win' && winningSide !== 'loss') {
+    throw new Error(`Invalid winning side ${winningSide}`);
+  }
+  const losingSide = winningSide === 'win' ? 'loss' : 'win';
+  const winningPool = bet.pools?.[winningSide] ?? 0;
+  const losingPool = bet.pools?.[losingSide] ?? 0;
+  const totalPool = winningPool + losingPool;
+  const stakes = bet.stakes ?? {};
+
+  // Nobody backed the winning side → refund everyone their stake.
+  if (winningPool === 0) {
+    const payouts = [];
+    for (const [userId, s] of Object.entries(stakes)) {
+      const refund = (s.win ?? 0) + (s.loss ?? 0);
+      if (refund > 0) {
+        payouts.push({ discordUserId: userId, amount: refund, kind: 'refund' });
+      }
+    }
+    return {
+      payouts,
+      totalPaid: payouts.reduce((sum, p) => sum + p.amount, 0),
+      refund: true,
+    };
+  }
+
+  // Normal: winners take a proportional cut of total pool.
+  const payouts = [];
+  for (const [userId, s] of Object.entries(stakes)) {
+    const stakeOnWinner = s?.[winningSide] ?? 0;
+    if (stakeOnWinner === 0) continue;
+    const payout = Math.round((stakeOnWinner / winningPool) * totalPool);
+    payouts.push({ discordUserId: userId, amount: payout, kind: 'win' });
+  }
+  return {
+    payouts,
+    totalPaid: payouts.reduce((sum, p) => sum + p.amount, 0),
+    refund: false,
+  };
+}
+
+/**
+ * Channel message when a bet resolves. Lists the winners' payouts inline.
+ */
+export function buildBetResolvedMessage(bet, winningSide, payouts) {
+  const target = bet.targetDiscordId ? `<@${bet.targetDiscordId}>` : `**${bet.displayName}**`;
+  const verdict = winningSide === 'win' ? '✅ WIN' : '❌ LOSS';
+  const totalPool = (bet.pools?.win ?? 0) + (bet.pools?.loss ?? 0);
+
+  if (payouts.length === 0) {
+    return `🎲 Prediction resolved: ${target} → ${verdict}\nNobody had a stake. The void claims ${totalPool.toLocaleString()} souls.`;
+  }
+
+  const lines = payouts.map(
+    (p) => `  • <@${p.discordUserId}> +${p.amount.toLocaleString()} souls`,
+  );
+  return `🎲 Prediction resolved: ${target} → ${verdict}\n${lines.join('\n')}`;
+}
+
+/**
+ * Channel message when a bet is refunded (no winners, or game crashed / timed out).
+ */
+export function buildBetRefundedMessage(bet, reason, payouts) {
+  const target = bet.targetDiscordId ? `<@${bet.targetDiscordId}>` : `**${bet.displayName}**`;
+  if (payouts.length === 0) {
+    return `🎲 Prediction void: ${target} — ${reason}. No stakes to refund.`;
+  }
+  const lines = payouts.map(
+    (p) => `  • <@${p.discordUserId}> refunded ${p.amount.toLocaleString()} souls`,
+  );
+  return `🎲 Prediction void: ${target} — ${reason}.\n${lines.join('\n')}`;
+}
+
 // --- Fraud Watch ----------------------------------------------------------
 
 /**

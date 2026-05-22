@@ -189,3 +189,23 @@ export async function getRankedEntries(puuid) {
   const { data } = await platformHttp.get(path);
   return Array.isArray(data) ? data : [];
 }
+
+/**
+ * Spectator-v5 active game lookup. Returns the live game payload if the
+ * player is currently in a game, or null if 404 (not in game). Other errors
+ * propagate. The endpoint is platform-routed.
+ *
+ * Payload of interest: { gameId, gameQueueConfigId, gameStartTime, mapId, ... }
+ * - gameQueueConfigId 420 = Ranked Solo, 440 = Ranked Flex; everything else
+ *   is unranked and the bet system ignores it.
+ */
+export async function getActiveGame(puuid) {
+  const path = `/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
+  try {
+    const { data } = await platformHttp.get(path);
+    return data;
+  } catch (err) {
+    if (err.response?.status === 404) return null;
+    throw err;
+  }
+}

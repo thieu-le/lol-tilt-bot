@@ -25,7 +25,12 @@ import {
   buildCurseLossMessage,
   computeFraudScore,
   buildFraudWatchMessage,
+  buildBetPoolMessage,
+  buildBetResolvedMessage,
+  buildBetRefundedMessage,
+  computeBetPayouts,
 } from './messages.js';
+import { buildStakeButtons } from './commands.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
 
@@ -253,6 +258,176 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       await storage.updatePlayer(player.puuid, { cursers: [] });
     }
   }
+
+  // Bet resolution — match-v5's matchId is "PLATFORM_GAMEID"; spectator gameId
+  // is just the numeric tail. Look up any open bet for this game and pay out.
+  const gameIdForBet = String(matchId).split('_').pop();
+  const bet = storage.getBetByGameId(gameIdForBet);
+  if (bet && (bet.status === 'open' || bet.status === 'awaiting_resolve') && !silent) {
+    await resolveBet(bet, won ? 'win' : 'loss', channel);
+  }
+}
+
+/**
+ * Pay out a bet and lock its channel message. Awards souls to each winner via
+ * the existing storage.awardSouls path so totalEarned counts these too.
+ */
+async function resolveBet(bet, winningSide, channel) {
+  const { payouts, refund } = computeBetPayouts(bet, winningSide);
+  for (const p of payouts) {
+    await storage.awardSouls(p.discordUserId, p.amount);
+  }
+  await storage.updateBet(bet.gameId, {
+    status: 'resolved',
+    resolvedSide: winningSide,
+    resolvedAt: new Date().toISOString(),
+  });
+
+  // Lock the original message (strip buttons, swap to locked content).
+  if (bet.channelMessageId) {
+    try {
+      const msg = await channel.messages.fetch(bet.channelMessageId);
+      await msg.edit({
+        content: buildBetPoolMessage(bet, { locked: true }),
+        components: [],
+      });
+    } catch (err) {
+      logger.warn(`Failed to lock bet message ${bet.channelMessageId}: ${err.message}`);
+    }
+  }
+
+  // Post the resolution announcement.
+  try {
+    const text = refund
+      ? buildBetRefundedMessage(bet, 'no one backed the winning side', payouts)
+      : buildBetResolvedMessage(bet, winningSide, payouts);
+    await channel.send({ content: text, allowedMentions: { parse: [] } });
+  } catch (err) {
+    logger.error(`Failed to post bet resolved message: ${err.message}`);
+  }
+
+  const totalPaid = payouts.reduce((s, p) => s + p.amount, 0);
+  logger.info(
+    `Bet ${bet.gameId} resolved as ${winningSide} — ${payouts.length} payout(s) totaling ${totalPaid} souls${refund ? ' (refunded)' : ''}`,
+  );
+}
+
+/**
+ * Spectator-v5 check. If the player is in an active ranked game and we don't
+ * already have an open bet for it, post a new prediction pool to the channel.
+ */
+async function maybeOpenBet(player, channel) {
+  let active;
+  try {
+    active = await riot.getActiveGame(player.puuid);
+  } catch (err) {
+    logger.warn(
+      `Spectator check failed for ${player.riotId.gameName}#${player.riotId.tagLine}: ${err.message}`,
+    );
+    return;
+  }
+
+  if (!active || !rank.isRankedQueue(active.gameQueueConfigId)) {
+    // Not in a ranked game right now. Transition any 'open' bet for this
+    // player to 'awaiting_resolve' so no more stakes are accepted while we
+    // wait for match-v5 to surface the finished match.
+    const openOnly = storage
+      .getOpenBetsForPuuid(player.puuid)
+      .filter((b) => b.status === 'open');
+    for (const b of openOnly) {
+      await storage.updateBet(b.gameId, { status: 'awaiting_resolve' });
+      if (b.channelMessageId) {
+        try {
+          const msg = await channel.messages.fetch(b.channelMessageId);
+          const refreshed = storage.getBetByGameId(b.gameId);
+          await msg.edit({
+            content: buildBetPoolMessage(refreshed, { locked: true }),
+            components: [],
+          });
+        } catch (err) {
+          logger.warn(`Failed to lock awaiting-resolve message: ${err.message}`);
+        }
+      }
+    }
+    return;
+  }
+
+  const gameId = String(active.gameId);
+  if (storage.getBetByGameId(gameId)) {
+    return; // bet already exists for this game
+  }
+
+  const newBet = {
+    gameId,
+    puuid: player.puuid,
+    riotIdSnapshot: { gameName: player.riotId.gameName, tagLine: player.riotId.tagLine },
+    displayName: `${player.riotId.gameName}#${player.riotId.tagLine}`,
+    targetDiscordId: player.discordUserId ?? null,
+    status: 'open',
+    openedAt: new Date().toISOString(),
+    channelMessageId: null,
+    pools: { win: 0, loss: 0 },
+    stakes: {},
+    resolvedSide: null,
+    resolvedAt: null,
+  };
+  await storage.createBet(newBet);
+
+  try {
+    const message = await channel.send({
+      content: buildBetPoolMessage(newBet),
+      components: [buildStakeButtons(gameId)],
+      allowedMentions: { parse: [] },
+    });
+    await storage.updateBet(gameId, { channelMessageId: message.id });
+    logger.info(
+      `Opened bet for ${player.riotId.gameName}#${player.riotId.tagLine} game ${gameId}`,
+    );
+  } catch (err) {
+    logger.error(`Failed to post bet open message for game ${gameId}: ${err.message}`);
+  }
+}
+
+/**
+ * Refund bets stuck in 'awaiting_resolve' for too long. Riot's match-v5 has
+ * usually surfaced a finished match within ~5 minutes; if 2 hours pass with
+ * nothing, the game probably crashed (remake, server issue) and we void.
+ */
+const STUCK_BET_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+async function refundStuckBets(channel) {
+  const stuck = storage.getBetsByStatus('awaiting_resolve');
+  const now = Date.now();
+  for (const bet of stuck) {
+    const opened = Date.parse(bet.openedAt ?? 0);
+    if (!Number.isFinite(opened) || now - opened < STUCK_BET_TIMEOUT_MS) continue;
+
+    // Build refund list: every stake returns to its owner.
+    const payouts = Object.entries(bet.stakes ?? {})
+      .map(([userId, s]) => ({
+        discordUserId: userId,
+        amount: (s.win ?? 0) + (s.loss ?? 0),
+        kind: 'refund',
+      }))
+      .filter((p) => p.amount > 0);
+
+    for (const p of payouts) {
+      await storage.awardSouls(p.discordUserId, p.amount);
+    }
+    await storage.updateBet(bet.gameId, {
+      status: 'refunded',
+      resolvedAt: new Date().toISOString(),
+    });
+    try {
+      await channel.send({
+        content: buildBetRefundedMessage(bet, 'match never resolved (timeout)', payouts),
+        allowedMentions: { parse: [] },
+      });
+    } catch (err) {
+      logger.error(`Failed to post bet refund message: ${err.message}`);
+    }
+    logger.info(`Bet ${bet.gameId} refunded after timeout — ${payouts.length} refund(s)`);
+  }
 }
 
 async function processPlayer(player, channel, { startup = false } = {}) {
@@ -301,6 +476,13 @@ async function processPlayer(player, channel, { startup = false } = {}) {
     // Re-read player state before each match so streak/today/rank are current.
     const current = storage.findByPuuid(player.puuid);
     await processMatch(current, matchId, channel, { silent: startup });
+  }
+
+  // After catch-up, peek at spectator-v5 to detect a fresh in-game session
+  // and open a bet for it. Skipped during startup to avoid spam on boot.
+  if (!startup) {
+    const refreshed = storage.findByPuuid(player.puuid);
+    await maybeOpenBet(refreshed, channel);
   }
 
   if (!startup) return null;
@@ -449,6 +631,18 @@ async function tick(channel, { startup = false } = {}) {
 
     if (startup && startupSummaries.length > 0) {
       await postStartupReport(channel, startupSummaries);
+    }
+
+    // Sweep any bets that have been awaiting resolution past the timeout
+    // (game crashed, server issue, anything that prevented match-v5 from
+    // surfacing the result). Skipped on the startup tick — give the boot
+    // sequence a clean log first.
+    if (!startup) {
+      try {
+        await refundStuckBets(channel);
+      } catch (err) {
+        logger.error(`Failed to sweep stuck bets: ${err.message}`);
+      }
     }
   } finally {
     running = false;
