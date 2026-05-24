@@ -596,6 +596,16 @@ async function handleBetButton(interaction) {
     });
     return;
   }
+  // Time-based gate: even if the poller hasn't transitioned status yet, refuse
+  // stakes that would land after the 2-minute window. Closes the race window.
+  const closeAt = bet.bettingClosesAt ? Date.parse(bet.bettingClosesAt) : null;
+  if (Number.isFinite(closeAt) && Date.now() > closeAt) {
+    await interaction.reply({
+      content: 'Betting window has closed (2 min after game start).',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
 
   const userSouls = storage.getSouls(interaction.user.id);
   const modal = new ModalBuilder()
@@ -639,6 +649,14 @@ async function handleBetModal(interaction) {
   if (!bet || bet.status !== 'open') {
     await interaction.reply({
       content: 'Betting is closed on this prediction.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const closeAt = bet.bettingClosesAt ? Date.parse(bet.bettingClosesAt) : null;
+  if (Number.isFinite(closeAt) && Date.now() > closeAt) {
+    await interaction.reply({
+      content: 'Betting window has closed (2 min after game start).',
       flags: MessageFlags.Ephemeral,
     });
     return;

@@ -36,13 +36,19 @@ import { config } from './config.js';
 
 const PER_PLAYER_DELAY_MS = 250;
 
+// Spectator polling cadence — independent from the match-v5 tick so game
+// starts get noticed within seconds rather than waiting on the slower loop.
+const SPECTATOR_TICK_MS = 20_000;
+const SPECTATOR_PER_PLAYER_DELAY_MS = 100;
+
 let intervalHandle = null;
-let running = false; // re-entrancy guard for overlapping ticks
+let spectatorIntervalHandle = null;
+let running = false; // re-entrancy guard for overlapping match ticks
+let spectatorRunning = false; // re-entrancy guard for overlapping spectator ticks
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
 
 // How many recent match IDs to fetch per tick. 20 covers any realistic offline
 // gap (most players don't play 20 ranked games between bot restarts).
@@ -312,9 +318,38 @@ async function resolveBet(bet, winningSide, channel) {
   );
 }
 
+// Betting closes 2 minutes after the in-game gameStartTime — measured from
+// Riot's clock, not from when the bot first noticed the game. This prevents
+// late-detected games from getting a fresh 2-min window where bettors might
+// already know the outcome.
+const BETTING_WINDOW_MS = 2 * 60 * 1000;
+
 /**
- * Spectator-v5 check. If the player is in an active ranked game and we don't
- * already have an open bet for it, post a new prediction pool to the channel.
+ * Lock a bet's status to 'awaiting_resolve' and strip the buttons from its
+ * channel message. Idempotent — safe to call concurrently from spectator and
+ * time-based close paths.
+ */
+async function transitionToAwaitingResolve(bet, channel) {
+  if (bet.status !== 'open') return;
+  await storage.updateBet(bet.gameId, { status: 'awaiting_resolve' });
+  if (!bet.channelMessageId) return;
+  try {
+    const msg = await channel.messages.fetch(bet.channelMessageId);
+    const refreshed = storage.getBetByGameId(bet.gameId);
+    await msg.edit({
+      content: buildBetPoolMessage(refreshed, { locked: true }),
+      components: [],
+    });
+  } catch (err) {
+    logger.warn(`Failed to lock bet message ${bet.channelMessageId}: ${err.message}`);
+  }
+}
+
+/**
+ * Spectator-v5 check. Opens a fresh bet when the player is in an active
+ * ranked game AND the game started less than 2 minutes ago. Late detections
+ * (Riot's spectator API can lag 30–90s) are skipped so we don't post a
+ * "prediction open" message in the middle of a game.
  */
 async function maybeOpenBet(player, channel) {
   let active;
@@ -328,27 +363,6 @@ async function maybeOpenBet(player, channel) {
   }
 
   if (!active || !rank.isRankedQueue(active.gameQueueConfigId)) {
-    // Not in a ranked game right now. Transition any 'open' bet for this
-    // player to 'awaiting_resolve' so no more stakes are accepted while we
-    // wait for match-v5 to surface the finished match.
-    const openOnly = storage
-      .getOpenBetsForPuuid(player.puuid)
-      .filter((b) => b.status === 'open');
-    for (const b of openOnly) {
-      await storage.updateBet(b.gameId, { status: 'awaiting_resolve' });
-      if (b.channelMessageId) {
-        try {
-          const msg = await channel.messages.fetch(b.channelMessageId);
-          const refreshed = storage.getBetByGameId(b.gameId);
-          await msg.edit({
-            content: buildBetPoolMessage(refreshed, { locked: true }),
-            components: [],
-          });
-        } catch (err) {
-          logger.warn(`Failed to lock awaiting-resolve message: ${err.message}`);
-        }
-      }
-    }
     return;
   }
 
@@ -357,6 +371,19 @@ async function maybeOpenBet(player, channel) {
     return; // bet already exists for this game
   }
 
+  // Skip stale game detections — the betting window has already closed.
+  const startedAt = Number.isFinite(active.gameStartTime) && active.gameStartTime > 0
+    ? active.gameStartTime
+    : Date.now();
+  const ageMs = Date.now() - startedAt;
+  if (ageMs > BETTING_WINDOW_MS) {
+    logger.info(
+      `Game ${gameId} for ${player.riotId.gameName}#${player.riotId.tagLine} is ${Math.round(ageMs / 1000)}s in — past the 2min window, skipping bet`,
+    );
+    return;
+  }
+
+  const bettingClosesAtMs = startedAt + BETTING_WINDOW_MS;
   const newBet = {
     gameId,
     puuid: player.puuid,
@@ -365,6 +392,8 @@ async function maybeOpenBet(player, channel) {
     targetDiscordId: player.discordUserId ?? null,
     status: 'open',
     openedAt: new Date().toISOString(),
+    gameStartTime: startedAt,
+    bettingClosesAt: new Date(bettingClosesAtMs).toISOString(),
     channelMessageId: null,
     pools: { win: 0, loss: 0 },
     stakes: {},
@@ -380,11 +409,28 @@ async function maybeOpenBet(player, channel) {
       allowedMentions: { parse: [] },
     });
     await storage.updateBet(gameId, { channelMessageId: message.id });
+    const secsLeft = Math.max(0, Math.round((bettingClosesAtMs - Date.now()) / 1000));
     logger.info(
-      `Opened bet for ${player.riotId.gameName}#${player.riotId.tagLine} game ${gameId}`,
+      `Opened bet for ${player.riotId.gameName}#${player.riotId.tagLine} game ${gameId} — ${secsLeft}s of betting left`,
     );
   } catch (err) {
     logger.error(`Failed to post bet open message for game ${gameId}: ${err.message}`);
+  }
+}
+
+/**
+ * Scan every 'open' bet and transition any past its bettingClosesAt to
+ * 'awaiting_resolve'. Time-driven so the close fires even when spectator
+ * polling lags. Bets stay alive — they resolve on the match-v5 outcome.
+ */
+async function closeBetsPastWindow(channel) {
+  const open = storage.getBetsByStatus('open');
+  const now = Date.now();
+  for (const bet of open) {
+    const closeAt = bet.bettingClosesAt ? Date.parse(bet.bettingClosesAt) : null;
+    if (Number.isFinite(closeAt) && now > closeAt) {
+      await transitionToAwaitingResolve(bet, channel);
+    }
   }
 }
 
@@ -478,12 +524,8 @@ async function processPlayer(player, channel, { startup = false } = {}) {
     await processMatch(current, matchId, channel, { silent: startup });
   }
 
-  // After catch-up, peek at spectator-v5 to detect a fresh in-game session
-  // and open a bet for it. Skipped during startup to avoid spam on boot.
-  if (!startup) {
-    const refreshed = storage.findByPuuid(player.puuid);
-    await maybeOpenBet(refreshed, channel);
-  }
+  // Spectator detection now lives in its own faster tick (SPECTATOR_TICK_MS)
+  // so the betting window catches game starts within seconds, not minutes.
 
   if (!startup) return null;
 
@@ -602,6 +644,39 @@ function scheduleEndOfDayReport(channel) {
   logger.info(`End-of-day report scheduled for ${fireTime}`);
 }
 
+/**
+ * Spectator-only tick. Detects new in-game ranked sessions and closes any
+ * bets whose 2-min window has expired. Runs on its own short interval
+ * (SPECTATOR_TICK_MS) so detection isn't gated by the slower match poll.
+ */
+async function spectatorTick(channel) {
+  if (spectatorRunning) {
+    logger.debug('Skipping spectator tick — previous still running');
+    return;
+  }
+  spectatorRunning = true;
+  try {
+    const players = storage.getPlayers();
+    for (const player of players) {
+      try {
+        await maybeOpenBet(player, channel);
+      } catch (err) {
+        logger.warn(
+          `Spectator tick error for ${player.riotId.gameName}#${player.riotId.tagLine}: ${err.message}`,
+        );
+      }
+      await sleep(SPECTATOR_PER_PLAYER_DELAY_MS);
+    }
+    try {
+      await closeBetsPastWindow(channel);
+    } catch (err) {
+      logger.error(`Failed to close bets past window: ${err.message}`);
+    }
+  } finally {
+    spectatorRunning = false;
+  }
+}
+
 async function tick(channel, { startup = false } = {}) {
   if (running) {
     logger.debug('Skipping tick — previous tick still running');
@@ -665,11 +740,19 @@ export async function startPoller({ client }) {
       `DISCORD_CHANNEL_ID ${config.discord.channelId} did not resolve to a text channel`,
     );
   }
-  logger.info(`Poller started (interval ${config.pollIntervalMs}ms)`);
+  logger.info(
+    `Poller started (match-v5 every ${config.pollIntervalMs}ms, spectator every ${SPECTATOR_TICK_MS}ms)`,
+  );
   // Fire-and-forget the first tick so startup logs aren't blocked by a slow
   // Riot response.
   tick(channel, { startup: true });
   intervalHandle = setInterval(() => tick(channel), config.pollIntervalMs);
+
+  // Dedicated spectator loop — runs much more frequently than the match-v5
+  // loop so live game starts land in the 2-min betting window.
+  spectatorTick(channel);
+  spectatorIntervalHandle = setInterval(() => spectatorTick(channel), SPECTATOR_TICK_MS);
+
   scheduleEndOfDayReport(channel);
 }
 
@@ -677,6 +760,10 @@ export function stopPoller() {
   if (intervalHandle) {
     clearInterval(intervalHandle);
     intervalHandle = null;
-    logger.info('Poller stopped');
   }
+  if (spectatorIntervalHandle) {
+    clearInterval(spectatorIntervalHandle);
+    spectatorIntervalHandle = null;
+  }
+  logger.info('Poller stopped');
 }

@@ -224,13 +224,22 @@ export function buildBetPoolMessage(bet, { locked = false } = {}) {
   }
 
   const status = locked
-    ? '🔒 PREDICTION LOCKED — game ended, awaiting result'
+    ? '🔒 PREDICTION LOCKED — awaiting match result'
     : '🎲 PREDICTION OPEN';
 
   const target = bet.targetDiscordId ? `<@${bet.targetDiscordId}>` : `**${bet.displayName}**`;
-  const callToBet = locked
-    ? 'No more bets — payouts settle when the match resolves.'
-    : 'Click a button to stake your Tilted Souls. Locks when the match ends.';
+
+  // Discord renders <t:UNIX:R> as a live "in 1 minute" / "30 seconds ago"
+  // countdown that updates client-side. No bot edits needed for the timer.
+  let callToBet;
+  if (locked) {
+    callToBet = 'No more bets — payouts settle when the match resolves.';
+  } else if (bet.bettingClosesAt) {
+    const closeSec = Math.floor(Date.parse(bet.bettingClosesAt) / 1000);
+    callToBet = `Stake your Tilted Souls below. Betting closes <t:${closeSec}:R>.`;
+  } else {
+    callToBet = 'Stake your Tilted Souls below.';
+  }
 
   return [
     status,
