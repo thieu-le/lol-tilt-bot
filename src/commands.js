@@ -17,6 +17,7 @@ import {
 } from 'discord.js';
 import * as storage from './storage.js';
 import * as riot from './riotService.js';
+import * as rank from './rank.js';
 import { backfillTodayMatches } from './backfill.js';
 import {
   buildCurseAppliedMessage,
@@ -118,6 +119,35 @@ const betCommand = new SlashCommandBuilder()
     sub.setName('status').setDescription('List active or pending prediction pools'),
   );
 
+const hatewatchCommand = new SlashCommandBuilder()
+  .setName('hatewatch')
+  .setDescription('Watch random Riot IDs for demotions or loss streaks (lightweight tracking)')
+  .addSubcommand((sub) =>
+    sub
+      .setName('add')
+      .setDescription('Add a Riot ID to HateWatch — bot publicly announces who added them')
+      .addStringOption((opt) =>
+        opt.setName('gamename').setDescription("Target's Riot ID game name (before #)").setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt.setName('tagline').setDescription("Target's Riot ID tag line (after #)").setRequired(true),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('remove')
+      .setDescription('Remove a Riot ID from HateWatch (only your own additions)')
+      .addStringOption((opt) =>
+        opt.setName('gamename').setDescription('Riot ID game name').setRequired(true),
+      )
+      .addStringOption((opt) =>
+        opt.setName('tagline').setDescription('Riot ID tag line').setRequired(true),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub.setName('list').setDescription('Show all HateWatch entries and who added them'),
+  );
+
 const soulsCommand = new SlashCommandBuilder()
   .setName('souls')
   .setDescription('Tilted Souls — currency earned from successful curses')
@@ -144,6 +174,7 @@ export const commandData = [
   uncurseCommand.toJSON(),
   soulsCommand.toJSON(),
   betCommand.toJSON(),
+  hatewatchCommand.toJSON(),
 ];
 
 // --- Bet UI helpers (used by poller too) -----------------------------------
@@ -570,6 +601,126 @@ async function handleBet(interaction) {
   await interaction.editReply(`Unknown /bet subcommand: ${sub}`);
 }
 
+// --- /hatewatch -----------------------------------------------------------
+
+async function handleHatewatchAdd(interaction) {
+  const gameName = interaction.options.getString('gamename', true);
+  const tagLine = interaction.options.getString('tagline', true);
+
+  const existing = storage.findHatewatchByRiotId(gameName, tagLine);
+  if (existing) {
+    await interaction.editReply(
+      `**${gameName}#${tagLine}** is already on HateWatch (added by <@${existing.addedBy}>).`,
+    );
+    return;
+  }
+
+  let account;
+  try {
+    account = await riot.getAccountByRiotId(gameName, tagLine);
+  } catch (err) {
+    if (err.code === 'NOT_FOUND') {
+      await interaction.editReply(`Couldn't find Riot ID **${gameName}#${tagLine}**.`);
+      return;
+    }
+    throw err;
+  }
+
+  // Snapshot the current latest match + rank so the poller has a baseline and
+  // doesn't fire "loss streak" alerts for matches that happened before they
+  // were added to HateWatch.
+  let lastProcessedMatchId = null;
+  let lastRank = null;
+  try {
+    const ids = await riot.getRecentMatchIds(account.puuid, 1, { type: 'ranked' });
+    if (ids.length) lastProcessedMatchId = ids[0];
+  } catch (err) {
+    logger.warn(`Failed to bootstrap hatewatch latest match: ${err.message}`);
+  }
+  try {
+    const entries = await riot.getRankedEntries(account.puuid);
+    const soloEntry = rank.findEntryForQueue(entries, 420);
+    const flexEntry = rank.findEntryForQueue(entries, 440);
+    const entry = soloEntry ?? flexEntry;
+    if (entry) lastRank = rank.entryToSnapshot(entry);
+  } catch (err) {
+    logger.warn(`Failed to bootstrap hatewatch rank snapshot: ${err.message}`);
+  }
+
+  await storage.addHatewatch({
+    puuid: account.puuid,
+    riotId: { gameName: account.gameName, tagLine: account.tagLine },
+    addedBy: interaction.user.id,
+    addedByDisplayName: interaction.user.username,
+    lastProcessedMatchId,
+    lastRank,
+  });
+
+  // Public announcement so the whole server sees who's hating.
+  try {
+    const channel = await interaction.client.channels.fetch(config.discord.channelId);
+    await channel.send({
+      content: `🎯 <@${interaction.user.id}> has added **${account.gameName}#${account.tagLine}** to their HateWatch. Hoping for the worst 🪦`,
+      allowedMentions: { parse: [] },
+    });
+  } catch (err) {
+    logger.error(`Failed to post HateWatch add announcement: ${err.message}`);
+  }
+
+  await interaction.editReply(
+    `Added **${account.gameName}#${account.tagLine}** to HateWatch. The bot will announce demotions and 3+ loss streaks.`,
+  );
+}
+
+async function handleHatewatchRemove(interaction) {
+  const gameName = interaction.options.getString('gamename', true);
+  const tagLine = interaction.options.getString('tagline', true);
+
+  const entry = storage.findHatewatchByRiotId(gameName, tagLine);
+  if (!entry) {
+    await interaction.editReply(`**${gameName}#${tagLine}** isn't on HateWatch.`);
+    return;
+  }
+
+  const result = await storage.removeHatewatch(entry.puuid, interaction.user.id);
+  if (result.ok) {
+    await interaction.editReply(`Removed **${gameName}#${tagLine}** from HateWatch.`);
+    return;
+  }
+  if (result.reason === 'not_owner') {
+    await interaction.editReply(
+      `You can only remove HateWatch entries you added. <@${result.addedBy}> added this one.`,
+    );
+    return;
+  }
+  await interaction.editReply(`Couldn't remove — entry not found.`);
+}
+
+async function handleHatewatchList(interaction) {
+  const entries = storage.getHatewatch();
+  if (entries.length === 0) {
+    await interaction.editReply('HateWatch is empty. Use `/hatewatch add` to start cooking.');
+    return;
+  }
+  const lines = entries.map((e) => {
+    const rankStr = e.lastRank ? ` • ${rank.formatRank(e.lastRank)}` : '';
+    return `• **${e.riotId.gameName}#${e.riotId.tagLine}**${rankStr} — added by <@${e.addedBy}>`;
+  });
+  const embed = new EmbedBuilder()
+    .setTitle('HateWatch')
+    .setColor(0xa83232)
+    .setDescription(lines.join('\n'));
+  await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+}
+
+async function handleHatewatch(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'add') return handleHatewatchAdd(interaction);
+  if (sub === 'remove') return handleHatewatchRemove(interaction);
+  if (sub === 'list') return handleHatewatchList(interaction);
+  await interaction.editReply(`Unknown /hatewatch subcommand: ${sub}`);
+}
+
 /**
  * Button click on a bet message. customId = `bet:stake:{gameId}:{side}`.
  * Opens a modal asking how many souls to stake.
@@ -731,6 +882,7 @@ export async function handleInteraction(interaction) {
       if (interaction.commandName === 'uncurse') return await handleUncurse(interaction);
       if (interaction.commandName === 'souls') return await handleSouls(interaction);
       if (interaction.commandName === 'bet') return await handleBet(interaction);
+      if (interaction.commandName === 'hatewatch') return await handleHatewatch(interaction);
       await interaction.editReply(`Unknown command: ${interaction.commandName}`);
       return;
     }

@@ -23,7 +23,9 @@ const STORE_PATH = path.join(DATA_DIR, 'store.json');
 // `bets` is an array of bet pools created automatically when a tracked player
 // enters an active ranked game (detected via spectator-v5). Resolves when
 // match-v5 surfaces the finished match.
-const defaultData = { players: [], souls: {}, bets: [] };
+// `hatewatch` is a lightweight watchlist of Riot IDs that DON'T need to be
+// fully tracked — we just announce when they demote or go on loss streaks.
+const defaultData = { players: [], souls: {}, bets: [], hatewatch: [] };
 
 let db = null;
 
@@ -43,6 +45,7 @@ export async function init() {
   db.data.players ||= [];
   db.data.souls ||= {};
   db.data.bets ||= [];
+  db.data.hatewatch ||= [];
   await db.write();
 }
 
@@ -260,6 +263,74 @@ export function getBetsByStatus(...statuses) {
   ensureReady();
   const set = new Set(statuses);
   return (db.data.bets ?? []).filter((b) => set.has(b.status)).map((b) => ({ ...b }));
+}
+
+// --- HateWatch (loss-streak + demotion watchlist for any Riot ID) ----------
+
+export function getHatewatch() {
+  ensureReady();
+  return (db.data.hatewatch ?? []).map((e) => ({ ...e }));
+}
+
+export function findHatewatchByPuuid(puuid) {
+  ensureReady();
+  const e = (db.data.hatewatch ?? []).find((x) => x.puuid === puuid);
+  return e ? { ...e } : null;
+}
+
+export function findHatewatchByRiotId(gameName, tagLine) {
+  ensureReady();
+  const g = gameName.toLowerCase();
+  const t = tagLine.toLowerCase();
+  const e = (db.data.hatewatch ?? []).find(
+    (x) =>
+      x.riotId.gameName.toLowerCase() === g &&
+      x.riotId.tagLine.toLowerCase() === t,
+  );
+  return e ? { ...e } : null;
+}
+
+export async function addHatewatch(entry) {
+  ensureReady();
+  db.data.hatewatch ||= [];
+  if (db.data.hatewatch.some((x) => x.puuid === entry.puuid)) {
+    throw new Error(`Hatewatch already has ${entry.riotId.gameName}#${entry.riotId.tagLine}`);
+  }
+  db.data.hatewatch.push({
+    puuid: entry.puuid,
+    riotId: { gameName: entry.riotId.gameName, tagLine: entry.riotId.tagLine },
+    addedBy: entry.addedBy,
+    addedByDisplayName: entry.addedByDisplayName,
+    addedAt: entry.addedAt ?? new Date().toISOString(),
+    lastProcessedMatchId: entry.lastProcessedMatchId ?? null,
+    streak: entry.streak ?? { type: null, count: 0 },
+    lastRank: entry.lastRank ?? null,
+  });
+  await db.write();
+}
+
+export async function removeHatewatch(puuid, requesterDiscordId) {
+  ensureReady();
+  const entry = (db.data.hatewatch ?? []).find((x) => x.puuid === puuid);
+  if (!entry) return { ok: false, reason: 'not_found' };
+  if (entry.addedBy !== requesterDiscordId) {
+    return { ok: false, reason: 'not_owner', addedBy: entry.addedBy };
+  }
+  db.data.hatewatch = db.data.hatewatch.filter((x) => x.puuid !== puuid);
+  await db.write();
+  return { ok: true };
+}
+
+export async function updateHatewatch(puuid, patch) {
+  ensureReady();
+  const entry = (db.data.hatewatch ?? []).find((x) => x.puuid === puuid);
+  if (!entry) throw new Error(`No hatewatch entry for puuid ${puuid}`);
+  if (patch.streak) {
+    entry.streak = { ...entry.streak, ...patch.streak };
+    delete patch.streak;
+  }
+  Object.assign(entry, patch);
+  await db.write();
 }
 
 /**

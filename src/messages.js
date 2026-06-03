@@ -35,6 +35,20 @@ const PROMOTION_WIN = '{name} has ascended LFG';
 const WIN_STREAK_ENTRY = 'Is this winners queue? {name}'; // exactly 4
 const WIN_STREAK_DEEP  = '{name} is hot 🔥 {n} game winstreak'; // 5+
 
+// Vanilla wins — fires when there's no promotion and no 4+ winstreak. Keep
+// these short and a little tongue-in-cheek so they don't drown out tilt
+// messages on active days.
+const REGULAR_WIN = [
+  '{name} ate that 🍽️',
+  '{name} cooked',
+  '{name} got the dub',
+  '{name} won a game (rare)',
+  'yeah {name} won, calm down',
+  '{name} +{lp_or_W}',
+  '{name} farmed enemies for breakfast',
+  '{name} did NOT tilt today',
+];
+
 function pickRandom(list) {
   return list[Math.floor(Math.random() * list.length)];
 }
@@ -119,6 +133,35 @@ function formatCurserList(curserMentions) {
   const head = curserMentions.slice(0, -1).join(', ');
   const tail = curserMentions[curserMentions.length - 1];
   return `${head}, and ${tail}`;
+}
+
+/**
+ * Locked-at-open multiplier for a prediction-pool side. Designed for the
+ * hybrid payout: stake × multiplier (floor) + share of losing pool (bonus).
+ * Mirror logic to curse multiplier: betting against form pays more.
+ *
+ *   side='win'  → high mult when target's recent form is BAD (upset to win)
+ *   side='loss' → high mult when target's recent form is GOOD (upset to lose)
+ */
+export function computeBetMultiplier(recentResults, side) {
+  const fallback = 1.5;
+  if (!recentResults || recentResults.length === 0) return fallback;
+  const wins = recentResults.filter((r) => r === 'W').length;
+  const wr = wins / recentResults.length;
+
+  if (side === 'loss') {
+    if (wr >= 0.80) return 3.0;
+    if (wr >= 0.60) return 2.0;
+    if (wr >= 0.40) return 1.5;
+    if (wr >= 0.20) return 1.2;
+    return 1.1;
+  }
+  // 'win' side
+  if (wr <= 0.20) return 3.0;
+  if (wr <= 0.40) return 2.0;
+  if (wr <= 0.60) return 1.5;
+  if (wr <= 0.80) return 1.2;
+  return 1.1;
 }
 
 /**
@@ -211,16 +254,15 @@ export function buildBetPoolMessage(bet, { locked = false } = {}) {
   const winBackers = Object.values(stakes).filter((s) => (s?.win ?? 0) > 0).length;
   const lossBackers = Object.values(stakes).filter((s) => (s?.loss ?? 0) > 0).length;
 
-  function multiplierLine(side, sidePool, backers) {
-    if (sidePool === 0) {
-      return `${side} 0 souls • 0 backers • no takers yet`;
+  function multiplierLine(side, sidePool, backers, sideKey) {
+    const baseMult = bet.multipliers?.[sideKey];
+    const stakeLabel = `${sidePool.toLocaleString()} souls`;
+    const backerLabel = backers === 1 ? '1 backer' : `${backers} backers`;
+    if (baseMult === undefined || baseMult === null) {
+      // Legacy bets created before multipliers were stored.
+      return `${side} ${stakeLabel} • ${backerLabel}`;
     }
-    if (totalPool === sidePool) {
-      // Only one side has bets — payout would be refund-only.
-      return `${side} ${sidePool.toLocaleString()} souls • ${backers} backers • no opponents (refund only)`;
-    }
-    const mult = totalPool / sidePool;
-    return `${side} ${sidePool.toLocaleString()} souls • ${backers} backers • ${mult.toFixed(2)}x payout`;
+    return `${side} ${baseMult.toFixed(1)}x base • ${stakeLabel} • ${backerLabel}`;
   }
 
   const status = locked
@@ -246,10 +288,10 @@ export function buildBetPoolMessage(bet, { locked = false } = {}) {
     `${target} is live in ranked.`,
     callToBet,
     '',
-    multiplierLine('✅ WIN  ', winPool, winBackers),
-    multiplierLine('❌ LOSS ', lossPool, lossBackers),
+    multiplierLine('✅ WIN  ', winPool, winBackers, 'win'),
+    multiplierLine('❌ LOSS ', lossPool, lossBackers, 'loss'),
     '',
-    `Total pool: ${totalPool.toLocaleString()} souls`,
+    `Total pool: ${totalPool.toLocaleString()} souls — winners get base × stake + share of losing pool.`,
   ].join('\n');
 }
 
@@ -287,12 +329,16 @@ export function computeBetPayouts(bet, winningSide) {
     };
   }
 
-  // Normal: winners take a proportional cut of total pool.
+  // Hybrid: stake × locked base multiplier (floor) + proportional share of
+  // losing pool (bonus). Solo voters still come out ahead via the base mult.
+  const baseMult = bet.multipliers?.[winningSide] ?? 1.0;
   const payouts = [];
   for (const [userId, s] of Object.entries(stakes)) {
     const stakeOnWinner = s?.[winningSide] ?? 0;
     if (stakeOnWinner === 0) continue;
-    const payout = Math.round((stakeOnWinner / winningPool) * totalPool);
+    const base = stakeOnWinner * baseMult;
+    const bonus = losingPool > 0 ? (stakeOnWinner / winningPool) * losingPool : 0;
+    const payout = Math.round(base + bonus);
     payouts.push({ discordUserId: userId, amount: payout, kind: 'win' });
   }
   return {
@@ -446,6 +492,19 @@ export function pickDemotionMessage(displayToken, opts = {}) {
  */
 export function pickPromotionMessage(displayToken, opts = {}) {
   return PROMOTION_WIN.replaceAll('{name}', displayToken) + buildDetailLine(opts);
+}
+
+/**
+ * Build a "vanilla" win message — called when the player won but didn't
+ * promote and isn't on a 4+ streak. Detail line still gets appended.
+ */
+export function pickRegularWinMessage(displayToken, opts = {}) {
+  const template = pickRandom(REGULAR_WIN);
+  const lpOrW = opts.lpDelta ?? '1W';
+  const msg = template
+    .replaceAll('{name}', displayToken)
+    .replaceAll('{lp_or_W}', lpOrW);
+  return msg + buildDetailLine(opts);
 }
 
 /**

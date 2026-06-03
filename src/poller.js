@@ -20,6 +20,7 @@ import {
   pickDemotionMessage,
   pickPromotionMessage,
   pickWinStreakMessage,
+  pickRegularWinMessage,
   computeTiltMeter,
   buildCurseBrokenMessage,
   buildCurseLossMessage,
@@ -29,6 +30,7 @@ import {
   buildBetResolvedMessage,
   buildBetRefundedMessage,
   computeBetPayouts,
+  computeBetMultiplier,
 } from './messages.js';
 import { buildStakeButtons } from './commands.js';
 import { logger } from './logger.js';
@@ -107,6 +109,7 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   const newToday = nextToday(player.today, won, config.timezone);
 
   let lpDeltaStr = null;
+  let lpDeltaNum = null;
   let rankLabel = null;
   let newLastRank = player.lastRank ?? null;
   let rankChange = null;
@@ -117,7 +120,7 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       const snapshot = rank.entryToSnapshot(entry);
       rankChange = rank.getRankChange(player.lastRank, snapshot);
       if (player.lastRank && player.lastRank.queueType === snapshot.queueType) {
-        const lpDeltaNum = rank.computeLpDelta(player.lastRank, snapshot);
+        lpDeltaNum = rank.computeLpDelta(player.lastRank, snapshot);
         lpDeltaStr = rank.formatLpDelta(lpDeltaNum);
         if (lpDeltaNum !== null) newToday.lpDelta = (newToday.lpDelta ?? 0) + lpDeltaNum;
       }
@@ -183,6 +186,9 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       text = pickPromotionMessage(displayToken, detailOpts);
     } else if (newStreak.type === 'W' && newStreak.count >= 4) {
       text = pickWinStreakMessage(displayToken, newStreak, detailOpts);
+    } else {
+      // Vanilla win — always fire something so wins are tracked, not silent.
+      text = pickRegularWinMessage(displayToken, detailOpts);
     }
   }
 
@@ -191,6 +197,32 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       await channel.send({ content: text, allowedMentions });
     } catch (err) {
       logger.error(`Failed to post message: ${err.message}`);
+    }
+  }
+
+  // Participation payout — +100 souls every ranked match played. Gated by
+  // !silent so backfill / catch-up after restart don't retroactively mint
+  // souls (otherwise re-adding via /track add becomes a soul farm).
+  if (!silent && player.discordUserId) {
+    try {
+      await storage.awardSouls(player.discordUserId, 100);
+    } catch (err) {
+      logger.warn(`Failed to award participation souls: ${err.message}`);
+    }
+  }
+
+  // Aegis Double LP — the +38/+40 LP blessing event. Anything above the
+  // normal 20-28 LP range almost always means an Aegis or first-win bonus.
+  if (!silent && won && Number.isFinite(lpDeltaNum) && lpDeltaNum >= 30) {
+    try {
+      await channel.send({
+        content: `🛡️ The Tilt Gods have blessed ${displayToken} with double LP — **${lpDeltaStr}** from Aegis 🙏`,
+        allowedMentions: player.discordUserId
+          ? { users: [player.discordUserId] }
+          : { parse: [] },
+      });
+    } catch (err) {
+      logger.error(`Failed to post Aegis blessing: ${err.message}`);
     }
   }
 
@@ -384,6 +416,14 @@ async function maybeOpenBet(player, channel) {
   }
 
   const bettingClosesAtMs = startedAt + BETTING_WINDOW_MS;
+  // Lock the base multipliers at bet-open time using the target's recent
+  // 20-game form. Stored on the bet so the math is reproducible even after
+  // recentResults updates mid-game.
+  const recent = player.recentResults ?? [];
+  const multipliers = {
+    win: computeBetMultiplier(recent, 'win'),
+    loss: computeBetMultiplier(recent, 'loss'),
+  };
   const newBet = {
     gameId,
     puuid: player.puuid,
@@ -397,6 +437,7 @@ async function maybeOpenBet(player, channel) {
     channelMessageId: null,
     pools: { win: 0, loss: 0 },
     stakes: {},
+    multipliers,
     resolvedSide: null,
     resolvedAt: null,
   };
@@ -581,18 +622,21 @@ async function postEndOfDayReport(channel) {
   const playedToday = players.filter((p) => p.today?.date === todayKey);
   if (!playedToday.length) return;
 
-  // Only losers go on the leaderboard.
-  const entries = playedToday
-    .map((p) => ({
-      riotId: p.riotId,
-      discordUserId: p.discordUserId,
-      lpDelta: p.today.lpDelta ?? 0,
-    }))
+  const allEntries = playedToday.map((p) => ({
+    riotId: p.riotId,
+    discordUserId: p.discordUserId,
+    lpDelta: p.today.lpDelta ?? 0,
+  }));
+
+  const losers = allEntries
     .filter((e) => e.lpDelta < 0)
     .sort((a, b) => a.lpDelta - b.lpDelta); // most LP lost first
+  const winners = allEntries
+    .filter((e) => e.lpDelta > 0)
+    .sort((a, b) => b.lpDelta - a.lpDelta); // most LP gained first
 
-  // Players played but nobody lost LP — acknowledge the rare good day.
-  if (!entries.length) {
+  // --- Tilt leaderboard (losers) ---
+  if (losers.length === 0) {
     try {
       await channel.send({
         content: 'No tilt today 🙏 the Tilt Gods are unsatisfied.',
@@ -601,29 +645,41 @@ async function postEndOfDayReport(channel) {
     } catch (err) {
       logger.error(`Failed to post no-tilt report: ${err.message}`);
     }
-    return;
+  } else {
+    const totalSacrificed = Math.abs(losers.reduce((sum, e) => sum + e.lpDelta, 0));
+    const lines = losers.map((e, i) => {
+      const token = e.discordUserId ? `<@${e.discordUserId}>` : `**${e.riotId.gameName}**`;
+      const lpStr = rank.formatLpDelta(e.lpDelta) ?? '+0 LP';
+      return `${i + 1}. ${token} ${lpStr}`;
+    });
+    const mentioned = losers.filter((e) => e.discordUserId).map((e) => e.discordUserId);
+    try {
+      await channel.send({
+        content: `Thus ends another day of tilt. ${totalSacrificed} LP has been sacrificed to the Tilt Gods.\nTilt Patreon Leaderboard:\n${lines.join('\n')}`,
+        allowedMentions: mentioned.length > 0 ? { users: mentioned } : { parse: [] },
+      });
+    } catch (err) {
+      logger.error(`Failed to post end-of-day report: ${err.message}`);
+    }
   }
 
-  // Total LP surrendered to the Tilt Gods (all entries are negative now).
-  const totalSacrificed = Math.abs(
-    entries.reduce((sum, e) => sum + e.lpDelta, 0),
-  );
-
-  const lines = entries.map((e, i) => {
-    const token = e.discordUserId ? `<@${e.discordUserId}>` : `**${e.riotId.gameName}**`;
-    const lpStr = rank.formatLpDelta(e.lpDelta) ?? '+0 LP';
-    return `${i + 1}. ${token} ${lpStr}`;
-  });
-
-  const mentionedIds = entries.filter((e) => e.discordUserId).map((e) => e.discordUserId);
-
-  try {
-    await channel.send({
-      content: `Thus ends another day of tilt. ${totalSacrificed} LP has been sacrificed to the Tilt Gods.\nTilt Patreon Leaderboard:\n${lines.join('\n')}`,
-      allowedMentions: mentionedIds.length > 0 ? { users: mentionedIds } : { parse: [] },
+  // --- Tilt God's Greatest Warriors (winners) ---
+  if (winners.length > 0) {
+    const totalGained = winners.reduce((sum, e) => sum + e.lpDelta, 0);
+    const lines = winners.map((e, i) => {
+      const token = e.discordUserId ? `<@${e.discordUserId}>` : `**${e.riotId.gameName}**`;
+      const lpStr = rank.formatLpDelta(e.lpDelta) ?? '+0 LP';
+      return `${i + 1}. ${token} ${lpStr}`;
     });
-  } catch (err) {
-    logger.error(`Failed to post end-of-day report: ${err.message}`);
+    const mentioned = winners.filter((e) => e.discordUserId).map((e) => e.discordUserId);
+    try {
+      await channel.send({
+        content: `⚔️ **Tilt God's Greatest Warriors** today (+${totalGained} LP combined):\n${lines.join('\n')}`,
+        allowedMentions: mentioned.length > 0 ? { users: mentioned } : { parse: [] },
+      });
+    } catch (err) {
+      logger.error(`Failed to post Greatest Warriors report: ${err.message}`);
+    }
   }
 }
 
@@ -677,6 +733,113 @@ async function spectatorTick(channel) {
   }
 }
 
+/**
+ * HateWatch processing — light per-entry tick. Watches the entry for
+ * loss-streak milestones (3, then every loss after 5) and rank demotions,
+ * then posts a public announcement crediting whoever added them.
+ *
+ * No today-tracking, no tilt meter, no curses, no souls — just the bare
+ * loss-detection signal.
+ */
+async function processHatewatchEntry(entry, channel, { silent = false } = {}) {
+  let ids;
+  try {
+    ids = await riot.getRecentMatchIds(entry.puuid, 20, { type: 'ranked' });
+  } catch (err) {
+    logger.warn(`HateWatch fetch error for ${entry.riotId.gameName}: ${err.message}`);
+    return;
+  }
+  if (!ids.length) return;
+
+  // First-time bootstrap: pin to the latest, no announcements for historical games.
+  if (entry.lastProcessedMatchId === null) {
+    await storage.updateHatewatch(entry.puuid, { lastProcessedMatchId: ids[0] });
+    return;
+  }
+
+  const newIds = [];
+  for (const id of ids) {
+    if (id === entry.lastProcessedMatchId) break;
+    newIds.push(id);
+  }
+  if (!newIds.length) return;
+  newIds.reverse(); // oldest first
+
+  let streak = entry.streak ?? { type: null, count: 0 };
+  let lastRank = entry.lastRank ?? null;
+  let lastProcessed = entry.lastProcessedMatchId;
+
+  for (const matchId of newIds) {
+    let match;
+    try {
+      match = await riot.getMatch(matchId);
+    } catch (err) {
+      logger.warn(`HateWatch match fetch error: ${err.message}`);
+      continue;
+    }
+    const summary = riot.extractMatchSummary(match, entry.puuid);
+    if (!summary) {
+      lastProcessed = matchId;
+      continue;
+    }
+    if (!rank.isRankedQueue(summary.queueId)) {
+      lastProcessed = matchId;
+      continue;
+    }
+
+    const won = summary.won;
+    streak = nextStreak(streak, won);
+
+    // Pull current ranked entries to detect demotions. One extra request per
+    // processed match — acceptable since HateWatch is opt-in and small.
+    let rankChange = null;
+    let newRank = lastRank;
+    try {
+      const entries = await riot.getRankedEntries(entry.puuid);
+      const queueEntry = rank.findEntryForQueue(entries, summary.queueId);
+      if (queueEntry) {
+        const snapshot = rank.entryToSnapshot(queueEntry);
+        rankChange = rank.getRankChange(lastRank, snapshot);
+        newRank = snapshot;
+      }
+    } catch (err) {
+      logger.warn(`HateWatch rank fetch error: ${err.message}`);
+    }
+
+    if (!silent) {
+      const target = `**${entry.riotId.gameName}#${entry.riotId.tagLine}**`;
+      let announcement = null;
+      if (rankChange === 'demoted') {
+        const rankStr = newRank ? ` to ${rank.formatRank(newRank)}` : '';
+        announcement = `🪦 HateWatch: ${target} just **demoted**${rankStr} — added by <@${entry.addedBy}>`;
+      } else if (streak.type === 'L' && streak.count === 3) {
+        announcement = `🪦 HateWatch: ${target} is on a **3-loss streak** — added by <@${entry.addedBy}>`;
+      } else if (streak.type === 'L' && streak.count >= 5) {
+        announcement = `🪦 HateWatch: ${target} is on a **${streak.count}-loss streak** 💀 — added by <@${entry.addedBy}>`;
+      }
+      if (announcement) {
+        try {
+          await channel.send({
+            content: announcement,
+            allowedMentions: { parse: [] }, // never ping the adder for these
+          });
+        } catch (err) {
+          logger.error(`Failed to post HateWatch announcement: ${err.message}`);
+        }
+      }
+    }
+
+    lastProcessed = matchId;
+    lastRank = newRank;
+  }
+
+  await storage.updateHatewatch(entry.puuid, {
+    lastProcessedMatchId: lastProcessed,
+    streak,
+    lastRank,
+  });
+}
+
 async function tick(channel, { startup = false } = {}) {
   if (running) {
     logger.debug('Skipping tick — previous tick still running');
@@ -685,11 +848,12 @@ async function tick(channel, { startup = false } = {}) {
   running = true;
   try {
     const players = storage.getPlayers();
-    if (players.length === 0) {
-      logger.debug('No tracked players this tick');
+    const hatewatch = storage.getHatewatch();
+    if (players.length === 0 && hatewatch.length === 0) {
+      logger.debug('No tracked players or hatewatch entries this tick');
       return;
     }
-    logger.debug(`Polling ${players.length} player(s)`);
+    logger.debug(`Polling ${players.length} player(s), ${hatewatch.length} hatewatch entry(s)`);
 
     const startupSummaries = [];
     for (const player of players) {
@@ -706,6 +870,20 @@ async function tick(channel, { startup = false } = {}) {
 
     if (startup && startupSummaries.length > 0) {
       await postStartupReport(channel, startupSummaries);
+    }
+
+    // HateWatch — re-read on every tick since /hatewatch add can land between
+    // ticks. Pass `silent: startup` so we don't fire announcements during the
+    // boot catch-up.
+    for (const entry of storage.getHatewatch()) {
+      try {
+        await processHatewatchEntry(entry, channel, { silent: startup });
+      } catch (err) {
+        logger.error(
+          `Error processing hatewatch ${entry.riotId.gameName}#${entry.riotId.tagLine}: ${err.message}`,
+        );
+      }
+      await sleep(PER_PLAYER_DELAY_MS);
     }
 
     // Sweep any bets that have been awaiting resolution past the timeout
