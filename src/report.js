@@ -225,6 +225,156 @@ export function renderReportChart(series) {
   return canvas.toBuffer('image/png');
 }
 
+// --- Squad chart (/analyze5s) ----------------------------------------------
+
+const SQUAD_H = 680;
+const SQUAD_DAMAGE = { top: 48, height: 220 };
+const SQUAD_GOLD = { top: 340, height: 110 };
+const SQUAD_ROWS = { top: 522, rowGap: 24 };
+const SQUAD_AXIS_Y = 664;
+// One color per teammate, distinct from the green/red used for K/D markers.
+const SQUAD_COLORS = ['#00a8fc', '#f0b232', '#c77dff', '#ff8fab', '#5eead4'];
+
+/**
+ * Team chart: every teammate's damage over time, team gold vs the enemy with
+ * objective markers and the throw point, and one K/A/D row per teammate.
+ * `series` is buildSquadSeries() output; `throwMs` marks where the game was
+ * thrown (or null). Returns a PNG Buffer.
+ */
+export function renderSquadChart(series, { throwMs = null, throwLabel = 'Thrown' } = {}) {
+  const canvas = createCanvas(W, SQUAD_H);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, SQUAD_H);
+
+  const maxMin = Math.max(series.gameEndMs / 60_000, 1);
+  const plotW = W - PAD_L - PAD_R;
+  const xAt = (min) => PAD_L + (min / maxMin) * plotW;
+  const xs = series.minutes.map(xAt);
+  const rowsBottom = SQUAD_ROWS.top + (series.players.length - 1) * SQUAD_ROWS.rowGap + 10;
+  const spans = [
+    [SQUAD_DAMAGE.top, SQUAD_DAMAGE.top + SQUAD_DAMAGE.height],
+    [SQUAD_GOLD.top, SQUAD_GOLD.top + SQUAD_GOLD.height],
+    [SQUAD_ROWS.top - 10, rowsBottom],
+  ];
+
+  const tickEvery = maxMin > 12 ? 5 : 2;
+  ctx.strokeStyle = C.grid;
+  ctx.lineWidth = 1;
+  for (let m = 0; m <= maxMin; m += tickEvery) {
+    for (const [top, bottom] of spans) {
+      ctx.beginPath();
+      ctx.moveTo(xAt(m), top);
+      ctx.lineTo(xAt(m), bottom);
+      ctx.stroke();
+    }
+    label(ctx, `${m}m`, xAt(m), SQUAD_AXIS_Y, { align: 'center' });
+  }
+
+  // Throw marker spans every panel.
+  if (Number.isFinite(throwMs)) {
+    const x = xAt(throwMs / 60_000);
+    ctx.strokeStyle = C.behind;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, SQUAD_DAMAGE.top);
+    ctx.lineTo(x, rowsBottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    label(ctx, throwLabel, x - 6, SQUAD_DAMAGE.top + 10, { color: C.behind, align: 'right', weight: 'bold' });
+  }
+
+  // --- Damage per teammate ----------------------------------------------------
+  const dmgMax = niceCeil(Math.max(...series.players.flatMap((p) => p.damage)));
+  const yDmg = (v) => SQUAD_DAMAGE.top + SQUAD_DAMAGE.height - (v / dmgMax) * SQUAD_DAMAGE.height;
+  label(ctx, 'Damage to champions', PAD_L, 22, { color: C.text, size: 15, weight: 'bold' });
+  for (let i = 0; i <= 4; i++) {
+    const v = (dmgMax / 4) * i;
+    label(ctx, formatK(v), PAD_L - 10, yDmg(v), { align: 'right' });
+  }
+  series.players.forEach((p, i) => drawLine(ctx, xs, p.damage.map(yDmg), SQUAD_COLORS[i % SQUAD_COLORS.length], { width: 2.5 }));
+  drawLegend(
+    ctx,
+    series.players.map((p, i) => ({ text: p.champion, color: SQUAD_COLORS[i % SQUAD_COLORS.length] })),
+    W - PAD_R,
+    22,
+  );
+
+  // --- Team gold vs enemy + objectives ------------------------------------------
+  label(ctx, 'Team gold vs enemy', PAD_L, SQUAD_GOLD.top - 26, { color: C.text, size: 15, weight: 'bold' });
+  const gMax = niceCeil(Math.max(...series.teamGoldDiff.map(Math.abs), 1000));
+  const mid = SQUAD_GOLD.top + SQUAD_GOLD.height / 2;
+  const yGold = (v) => mid - (v / gMax) * (SQUAD_GOLD.height / 2);
+  for (const v of [gMax, 0, -gMax]) {
+    label(ctx, (v > 0 ? '+' : '') + formatK(v), PAD_L - 10, yGold(v), { align: 'right' });
+  }
+  for (let i = 1; i < xs.length; i++) {
+    const avg = (series.teamGoldDiff[i - 1] + series.teamGoldDiff[i]) / 2;
+    ctx.fillStyle = avg >= 0 ? `${C.ahead}55` : `${C.behind}55`;
+    ctx.beginPath();
+    ctx.moveTo(xs[i - 1], mid);
+    ctx.lineTo(xs[i - 1], yGold(series.teamGoldDiff[i - 1]));
+    ctx.lineTo(xs[i], yGold(series.teamGoldDiff[i]));
+    ctx.lineTo(xs[i], mid);
+    ctx.closePath();
+    ctx.fill();
+  }
+  drawLine(ctx, xs, series.teamGoldDiff.map(yGold), C.text, { width: 1.5 });
+  // Objective markers: ours above the panel's top edge, theirs below the bottom.
+  for (const o of series.objectives) {
+    const x = xAt(o.t / 60_000);
+    const big = o.label === 'Baron' || o.label === 'Elder';
+    const y = o.ours ? SQUAD_GOLD.top - 6 : SQUAD_GOLD.top + SQUAD_GOLD.height + 8;
+    ctx.fillStyle = o.ours ? C.ahead : C.behind;
+    ctx.beginPath();
+    ctx.arc(x, y, big ? 5 : 3, 0, Math.PI * 2);
+    ctx.fill();
+    if (big) label(ctx, o.label, x, o.ours ? y - 12 : y + 13, { color: o.ours ? C.ahead : C.behind, size: 11, align: 'center', weight: 'bold' });
+  }
+
+  // --- K/A/D rows, one per teammate -------------------------------------------
+  // Title doubles as the legend: each word in its marker's color. (Plain
+  // words — the bundled latin font has no ▲●✕ glyphs.)
+  let titleX = PAD_L;
+  ctx.font = `bold 15px ${FONT}`;
+  for (const [word, color] of [['Kills', C.kill], [' / ', C.text], ['Assists', C.assist], [' / ', C.text], ['Deaths', C.death]]) {
+    label(ctx, word, titleX, SQUAD_ROWS.top - 32, { color, size: 15, weight: 'bold' });
+    titleX += ctx.measureText(word).width;
+  }
+  series.players.forEach((p, row) => {
+    const y = SQUAD_ROWS.top + row * SQUAD_ROWS.rowGap;
+    label(ctx, p.champion.slice(0, 7), PAD_L - 8, y, { align: 'right', color: SQUAD_COLORS[row % SQUAD_COLORS.length], size: 11, weight: 'bold' });
+    for (const ev of p.events) {
+      const x = xAt(ev.t / 60_000);
+      ctx.fillStyle = C[ev.kind];
+      ctx.strokeStyle = C[ev.kind];
+      if (ev.kind === 'kill') {
+        ctx.beginPath();
+        ctx.moveTo(x, y - 5);
+        ctx.lineTo(x + 5, y + 4);
+        ctx.lineTo(x - 5, y + 4);
+        ctx.closePath();
+        ctx.fill();
+      } else if (ev.kind === 'death') {
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(x - 4, y - 4);
+        ctx.lineTo(x + 4, y + 4);
+        ctx.moveTo(x + 4, y - 4);
+        ctx.lineTo(x - 4, y + 4);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  });
+
+  return canvas.toBuffer('image/png');
+}
+
 function formatPhase({ kills, deaths, assists }) {
   return `${kills}/${deaths}/${assists}`;
 }
@@ -398,12 +548,12 @@ export function buildReportEmbed(summary, series) {
  * Embed + chart attachment ready to spread into channel.send(). Falls back to
  * embed-only if rendering throws.
  */
-export function buildMatchReport(summary, series, logger) {
+export function buildMatchReport(summary, series, logger, fileName = 'report.png') {
   const embed = buildReportEmbed(summary, series);
   if (!series) return { embeds: [embed], files: [] };
   try {
-    const file = new AttachmentBuilder(renderReportChart(series), { name: 'report.png' });
-    embed.setImage('attachment://report.png');
+    const file = new AttachmentBuilder(renderReportChart(series), { name: fileName });
+    embed.setImage(`attachment://${fileName}`);
     return { embeds: [embed], files: [file] };
   } catch (err) {
     logger?.warn(`Failed to render match report chart: ${err.message}`);

@@ -1,12 +1,14 @@
 // Discord client wiring. We intentionally stay minimal:
 //   - Only the `Guilds` intent is needed for slash commands.
 //   - All command logic lives in commands.js.
+//   - Slash commands are (re)registered on ready, so a deploy that adds or
+//     changes a command needs no manual `npm run register-commands`.
 //   - The poller is started after the client signals ready.
 
 import { Client, Events, GatewayIntentBits } from 'discord.js';
 import { config } from './config.js';
 import { logger } from './logger.js';
-import { handleInteraction } from './commands.js';
+import { handleInteraction, commandData } from './commands.js';
 import { startPoller, stopPoller } from './poller.js';
 
 const client = new Client({
@@ -15,6 +17,15 @@ const client = new Client({
 
 client.once(Events.ClientReady, async (c) => {
   logger.info(`Logged in as ${c.user.tag}`);
+  // Same targeting as scripts/registerCommands.js: guild-scoped when
+  // DISCORD_GUILD_ID is set (instant), otherwise global (up to ~1h).
+  try {
+    await c.application.commands.set(commandData, config.discord.guildId ?? undefined);
+    logger.info(`Registered ${commandData.length} slash command(s)`);
+  } catch (err) {
+    // Non-fatal: previously registered commands keep working.
+    logger.warn(`Failed to register slash commands: ${err.message}`);
+  }
   try {
     await startPoller({ client });
   } catch (err) {

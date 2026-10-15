@@ -19,6 +19,7 @@ import * as storage from './storage.js';
 import * as riot from './riotService.js';
 import * as rank from './rank.js';
 import { backfillTodayMatches } from './backfill.js';
+import { findLastSquadMatch, loadSquadMatch, buildSquadAnalysis } from './analyze.js';
 import {
   buildCurseAppliedMessage,
   computePayoutMultiplier,
@@ -166,6 +167,16 @@ const soulsCommand = new SlashCommandBuilder()
     sub.setName('leaderboard').setDescription('Show the top 10 soul-holders in the server'),
   );
 
+const analyze5sCommand = new SlashCommandBuilder()
+  .setName('analyze5s')
+  .setDescription('Break down the last ranked game where 3+ tracked players were on the same team')
+  .addStringOption((opt) =>
+    opt
+      .setName('match')
+      .setDescription('Specific match ID to analyze instead, e.g. NA1_5659600977')
+      .setRequired(false),
+  );
+
 export const commandData = [
   trackCommand.toJSON(),
   streakCommand.toJSON(),
@@ -175,6 +186,7 @@ export const commandData = [
   soulsCommand.toJSON(),
   betCommand.toJSON(),
   hatewatchCommand.toJSON(),
+  analyze5sCommand.toJSON(),
 ];
 
 // --- Bet UI helpers (used by poller too) -----------------------------------
@@ -859,6 +871,54 @@ async function handleStreak(interaction) {
   );
 }
 
+async function handleAnalyze5s(interaction) {
+  const players = storage.getPlayers();
+  const requested = interaction.options.getString('match')?.trim().toUpperCase();
+
+  let found;
+  if (requested) {
+    try {
+      found = await loadSquadMatch(requested, players);
+    } catch (err) {
+      if (err.response?.status === 404) {
+        await interaction.editReply(`Couldn't find match \`${requested}\`.`);
+        return;
+      }
+      throw err;
+    }
+    if (!found) {
+      await interaction.editReply(
+        `\`${requested}\` wasn't a squad game (needs 3+ tracked players on one team, and no remake).`,
+      );
+      return;
+    }
+  } else {
+    found = await findLastSquadMatch(players);
+    if (!found) {
+      await interaction.editReply(
+        'No ranked game with 3+ tracked players on the same team in everyone\'s last 20 ranked games.',
+      );
+      return;
+    }
+  }
+
+  const { match, squad } = found;
+  let rawTimeline = null;
+  try {
+    rawTimeline = await riot.getMatchTimeline(match.metadata.matchId);
+  } catch (err) {
+    logger.warn(`analyze5s: timeline fetch failed for ${match.metadata.matchId}: ${err.message}`);
+  }
+
+  const [first, ...rest] = buildSquadAnalysis(match, rawTimeline, squad, logger);
+  // Command output is on-demand — show the mentions, don't ping anyone.
+  const allowedMentions = { parse: [] };
+  await interaction.editReply({ ...first, allowedMentions });
+  for (const msg of rest) {
+    await interaction.followUp({ ...msg, allowedMentions });
+  }
+}
+
 /**
  * Top-level dispatcher invoked from bot.js for every Discord interaction.
  * Routes slash commands, button clicks, and modal submits separately because
@@ -867,7 +927,12 @@ async function handleStreak(interaction) {
 export async function handleInteraction(interaction) {
   try {
     if (interaction.isChatInputCommand()) {
-      // Defer ephemeral so tracked-player chatter doesn't clutter the channel.
+      // Defer ephemeral so tracked-player chatter doesn't clutter the channel —
+      // except /analyze5s, which is meant for the whole squad to see.
+      if (interaction.commandName === 'analyze5s') {
+        await interaction.deferReply();
+        return await handleAnalyze5s(interaction);
+      }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       if (interaction.commandName === 'track') {

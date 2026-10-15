@@ -385,3 +385,69 @@ export function computeTrivia(timeline, puuid) {
     deathValue: countTradedDeaths(fights, pid, teamIds),
   };
 }
+
+// Objectives worth marking on the squad chart.
+const CHART_OBJECTIVES = {
+  BARON_NASHOR: 'Baron',
+  RIFTHERALD: 'Herald',
+  ATAKHAN: 'Atakhan',
+};
+
+/**
+ * Team-wide series for the /analyze5s squad chart. One line per teammate,
+ * team gold vs enemy, objectives, and each teammate's K/D/A events.
+ *
+ * Returns null without a timeline. Fields:
+ *   - minutes, gameEndMs
+ *   - players: [{ puuid, champion, damage: [cumulative], events: [{ t, kind }] }]
+ *   - teamGoldDiff: our team gold − enemy team gold per frame
+ *   - objectives: [{ t, label, ours }] — dragons (incl. Elder), Baron, Herald, Atakhan
+ */
+export function buildSquadSeries(timeline, match, teamId) {
+  const info = timeline?.info;
+  const frames = info?.frames ?? [];
+  if (!frames.length) return null;
+  const pidByPuuid = new Map((info.participants ?? []).map((x) => [x.puuid, x.participantId]));
+  const team = (match?.info?.participants ?? []).filter((p) => p.teamId === teamId);
+  const ourPids = team.map((p) => pidByPuuid.get(p.puuid)).filter(Boolean);
+  const enemyPids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].filter((id) => !ourPids.includes(id));
+
+  const events = frames.flatMap((f) => f.events ?? []);
+  const gameEndMs =
+    events.find((e) => e.type === 'GAME_END')?.timestamp ?? frames[frames.length - 1].timestamp;
+  const kills = events.filter((e) => e.type === 'CHAMPION_KILL');
+
+  const players = team.map((p) => {
+    const pid = pidByPuuid.get(p.puuid);
+    const playerEvents = [];
+    for (const e of kills) {
+      if (e.killerId === pid) playerEvents.push({ t: e.timestamp, kind: 'kill' });
+      else if (e.victimId === pid) playerEvents.push({ t: e.timestamp, kind: 'death' });
+      else if ((e.assistingParticipantIds ?? []).includes(pid)) playerEvents.push({ t: e.timestamp, kind: 'assist' });
+    }
+    return {
+      puuid: p.puuid,
+      champion: p.championName,
+      damage: frames.map((f) => champDamageAt(f, pid)),
+      events: playerEvents,
+    };
+  });
+
+  const teamGold = (f, pids) => pids.reduce((sum, id) => sum + goldAt(f, id), 0);
+  const objectives = events
+    .filter((e) => e.type === 'ELITE_MONSTER_KILL')
+    .map((e) => {
+      let label = CHART_OBJECTIVES[e.monsterType];
+      if (e.monsterType === 'DRAGON') label = e.monsterSubType === 'ELDER_DRAGON' ? 'Elder' : 'Drake';
+      return label ? { t: e.timestamp, label, ours: e.killerTeamId === teamId } : null;
+    })
+    .filter(Boolean);
+
+  return {
+    minutes: frames.map((f) => Math.min(f.timestamp, gameEndMs) / 60_000),
+    gameEndMs,
+    players,
+    teamGoldDiff: frames.map((f) => teamGold(f, ourPids) - teamGold(f, enemyPids)),
+    objectives,
+  };
+}
