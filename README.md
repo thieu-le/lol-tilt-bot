@@ -77,8 +77,9 @@ npm install
 **1. Create your Discord application** at <https://discord.com/developers/applications>.
 Under *Bot*, reset and copy the token. Copy the *Application ID* from *General
 Information*. Under *OAuth2 → URL Generator*, select the `bot` and
-`applications.commands` scopes plus `Send Messages` and `Embed Links`, and use the
-generated URL to invite the bot. Enable Developer Mode in Discord
+`applications.commands` scopes plus `Send Messages`, `Embed Links`, `Attach Files`
+(post-match chart images) and `Read Message History` (editing squad and bet posts),
+and use the generated URL to invite the bot. Enable Developer Mode in Discord
 (*Settings → Advanced*) to copy your target channel's ID.
 
 **2. Get a Riot API key** at <https://developer.riotgames.com/>. Development keys
