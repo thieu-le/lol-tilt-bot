@@ -25,7 +25,9 @@ const STORE_PATH = path.join(DATA_DIR, 'store.json');
 // match-v5 surfaces the finished match.
 // `hatewatch` is a lightweight watchlist of Riot IDs that DON'T need to be
 // fully tracked — we just announce when they demote or go on loss streaks.
-const defaultData = { players: [], souls: {}, bets: [], hatewatch: [] };
+// `squadPosts` tracks the single shared post for games where 3+ tracked
+// players were on the same team (ranked 5s / flex stacks).
+const defaultData = { players: [], souls: {}, bets: [], hatewatch: [], squadPosts: [] };
 
 let db = null;
 
@@ -46,6 +48,7 @@ export async function init() {
   db.data.souls ||= {};
   db.data.bets ||= [];
   db.data.hatewatch ||= [];
+  db.data.squadPosts ||= [];
   await db.write();
 }
 
@@ -263,6 +266,49 @@ export function getBetsByStatus(...statuses) {
   ensureReady();
   const set = new Set(statuses);
   return (db.data.bets ?? []).filter((b) => set.has(b.status)).map((b) => ({ ...b }));
+}
+
+// --- Squad posts (one shared post per ranked 5s / flex stack game) ---------
+
+// Squad posts older than this are pruned on write — they only matter for the
+// same-day roll-up and for squadmates processed a tick or two later.
+const SQUAD_POST_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+
+/**
+ * Shape: { matchId, squadKey, date, messageId, createdAt, header,
+ *          memberSections: { [puuid]: text }, result: { won, line } }
+ * `squadKey` is the sorted tracked puuids, so the same stack shares a key.
+ */
+export function getSquadPost(matchId) {
+  ensureReady();
+  const p = db.data.squadPosts?.find((x) => x.matchId === matchId);
+  return p ? structuredClone(p) : null;
+}
+
+/** Most recent squad post for this stack on `date`, other than `excludeMatchId`. */
+export function getLatestSquadPost(squadKey, date, excludeMatchId) {
+  ensureReady();
+  const matches = (db.data.squadPosts ?? []).filter(
+    (x) => x.squadKey === squadKey && x.date === date && x.matchId !== excludeMatchId,
+  );
+  if (!matches.length) return null;
+  return structuredClone(matches.reduce((a, b) => (a.createdAt > b.createdAt ? a : b)));
+}
+
+/** Insert or shallow-merge a squad post by matchId. Returns a copy. */
+export async function upsertSquadPost(matchId, patch) {
+  ensureReady();
+  db.data.squadPosts ||= [];
+  const cutoff = Date.now() - SQUAD_POST_RETENTION_MS;
+  db.data.squadPosts = db.data.squadPosts.filter((x) => Date.parse(x.createdAt) >= cutoff);
+  let post = db.data.squadPosts.find((x) => x.matchId === matchId);
+  if (!post) {
+    post = { matchId, createdAt: new Date().toISOString(), memberSections: {} };
+    db.data.squadPosts.push(post);
+  }
+  Object.assign(post, patch);
+  await db.write();
+  return structuredClone(post);
 }
 
 // --- HateWatch (loss-streak + demotion watchlist for any Riot ID) ----------

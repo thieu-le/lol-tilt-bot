@@ -37,6 +37,13 @@ import {
 } from './messages.js';
 import { analyzeTimeline, buildReportSeries } from './timeline.js';
 import { buildMatchReport } from './report.js';
+import {
+  findSquad,
+  computeSquadVerdict,
+  buildSquadHeader,
+  buildSquadScoreboard,
+  renderSquadPost,
+} from './squad.js';
 import { buildStakeButtons } from './commands.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
@@ -199,9 +206,10 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   // detectors run on end-of-game stats alone.
   let timeline = null;
   let reportSeries = null;
+  let rawTimeline = null;
   if (!silent) {
     try {
-      const rawTimeline = await riot.getMatchTimeline(matchId);
+      rawTimeline = await riot.getMatchTimeline(matchId);
       timeline = analyzeTimeline(rawTimeline, player.puuid);
       reportSeries = buildReportSeries(rawTimeline, match, player.puuid);
     } catch (err) {
@@ -330,15 +338,118 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     sections.push(await resolveBet(bet, won ? 'win' : 'loss', channel));
   }
 
-  if (!silent) {
-    await postGameReport(player, summary, {
+  if (silent) return;
+  const content = sections.filter(Boolean).join('\n\n');
+
+  // Ranked 5s / flex stacks share one squad post instead of one per player.
+  const squad = findSquad(match, player.puuid, storage.getPlayers());
+  if (squad) {
+    await postSquadSection(player, summary, {
       channel,
-      content: sections.filter(Boolean).join('\n\n'),
-      allowedMentions,
-      report: buildMatchReport(summary, reportSeries, logger),
-      lpDelta: lpDeltaStr,
+      match,
+      matchId,
+      rawTimeline,
+      squad,
+      content,
     });
+    await recordDayGame(player, summary, lpDeltaStr);
+    return;
   }
+
+  await postGameReport(player, summary, {
+    channel,
+    content,
+    allowedMentions,
+    report: buildMatchReport(summary, reportSeries, logger),
+    lpDelta: lpDeltaStr,
+  });
+}
+
+/**
+ * Add this player's lines to the shared squad post for the match, creating
+ * the post (with the carry / worst verdict) for whichever squadmate is
+ * processed first. Like solo posts, the squad keeps one live post per day:
+ * a new squad game replaces the stack's previous post from today.
+ */
+async function postSquadSection(player, summary, { channel, match, matchId, rawTimeline, squad, content }) {
+  const title = `${summary.championName} — ${player.riotId.gameName}`;
+  const existing = storage.getSquadPost(matchId);
+
+  if (existing?.messageId) {
+    const post = await storage.upsertSquadPost(matchId, {
+      memberSections: { ...existing.memberSections, [player.puuid]: { title, text: content } },
+    });
+    try {
+      const msg = await channel.messages.fetch(post.messageId);
+      await msg.edit({ ...renderSquadPost(post), allowedMentions: { parse: [] } });
+    } catch (err) {
+      logger.warn(`Failed to update squad post ${post.messageId}: ${err.message}`);
+    }
+    return;
+  }
+
+  const todayKey = rank.dateKey(config.timezone);
+  const verdict = computeSquadVerdict(match, squad.teamId, rawTimeline);
+  const prev = storage.getLatestSquadPost(squad.key, todayKey, matchId);
+  const history = [...(prev?.history ?? []), ...(prev ? [prev.result] : [])];
+  const earlierLine = history.length
+    ? `📅 Squad earlier today: ${history.map((r) => `${r.won ? '✅' : '❌'} carry ${r.carryChampion}`).join(' • ')}`
+    : null;
+
+  const post = await storage.upsertSquadPost(matchId, {
+    squadKey: squad.key,
+    date: todayKey,
+    won: verdict.won,
+    header: buildSquadHeader(verdict, squad),
+    scoreboard: buildSquadScoreboard(verdict, squad),
+    earlierLine,
+    history,
+    result: { won: verdict.won, carryChampion: verdict.carry.participant.championName },
+    memberSections: { [player.puuid]: { title, text: content } },
+  });
+
+  const squadIds = squad.members.map((m) => m.discordUserId).filter(Boolean);
+  let sent = null;
+  try {
+    sent = await channel.send({ ...renderSquadPost(post), allowedMentions: { users: squadIds } });
+  } catch (err) {
+    logger.error(`Failed to post squad report: ${err.message}`);
+    return;
+  }
+  await storage.upsertSquadPost(matchId, { messageId: sent.id });
+
+  if (prev?.messageId) {
+    try {
+      await channel.messages.delete(prev.messageId);
+    } catch (err) {
+      logger.warn(`Failed to delete previous squad post ${prev.messageId}: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * Add a game to the player's "Earlier today" list without touching their
+ * personal post (used for squad games, which live in the squad post).
+ */
+async function recordDayGame(player, summary, lpDelta) {
+  const todayKey = rank.dateKey(config.timezone);
+  const prev = player.dayPosts?.date === todayKey ? player.dayPosts : null;
+  await storage.updatePlayer(player.puuid, {
+    dayPosts: {
+      date: todayKey,
+      messageId: prev?.messageId ?? null,
+      games: [...(prev?.games ?? []), dayGameEntry(summary, lpDelta)],
+    },
+  });
+}
+
+function dayGameEntry(summary, lpDelta) {
+  return {
+    won: summary.won,
+    champion: summary.championName,
+    kda: `${summary.kills}/${summary.deaths}/${summary.assists}`,
+    lp: lpDelta ?? null,
+  };
 }
 
 // Discord's hard cap on message content.
@@ -390,15 +501,7 @@ async function postGameReport(player, summary, { channel, content, allowedMentio
     dayPosts: {
       date: todayKey,
       messageId: sent?.id ?? prev?.messageId ?? null,
-      games: [
-        ...earlierGames,
-        {
-          won: summary.won,
-          champion: summary.championName,
-          kda: `${summary.kills}/${summary.deaths}/${summary.assists}`,
-          lp: lpDelta ?? null,
-        },
-      ],
+      games: [...earlierGames, dayGameEntry(summary, lpDelta)],
     },
   });
 }
