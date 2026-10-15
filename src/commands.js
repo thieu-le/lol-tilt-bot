@@ -380,7 +380,7 @@ async function handleHistory(interaction) {
   }
 
   const lines = summaries.map((s) => {
-    const result = s.won ? '✅ W' : '❌ L';
+    const result = s.remake ? '🔁 Remake' : s.won ? '✅ W' : '❌ L';
     const kda = `${s.kills}/${s.deaths}/${s.assists}`;
     const ratio = ((s.kills + s.assists) / Math.max(s.deaths, 1)).toFixed(2);
     const dur = s.gameDuration ? `${Math.floor(s.gameDuration / 60)}m` : '';

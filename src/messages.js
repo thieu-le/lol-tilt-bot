@@ -298,10 +298,11 @@ export function buildBetPoolMessage(bet, { locked = false } = {}) {
 /**
  * Twitch-Predictions-style proportional payout math.
  *
- * Returns `{ payouts: [{discordUserId, amount, kind}], totalPaid, refund }`.
- *  - `kind: 'win'` — proportional cut of the total pool
- *  - `kind: 'refund'` — stake-back when the winning side had no backers
- *  - `refund: true` means all stakes go back to their original owners
+ * Returns `{ payouts: [{discordUserId, amount, kind}], losers: [{discordUserId, amount}], totalPaid }`.
+ *  - `kind: 'win'` — stake × base multiplier + proportional cut of the losing pool
+ *  - `losers` — stakes on the losing side, forfeited. Always forfeited, even
+ *    when nobody backed the winning side (a lone wrong bettor doesn't get
+ *    their souls back — the void claims them).
  */
 export function computeBetPayouts(bet, winningSide) {
   if (winningSide !== 'win' && winningSide !== 'loss') {
@@ -310,30 +311,17 @@ export function computeBetPayouts(bet, winningSide) {
   const losingSide = winningSide === 'win' ? 'loss' : 'win';
   const winningPool = bet.pools?.[winningSide] ?? 0;
   const losingPool = bet.pools?.[losingSide] ?? 0;
-  const totalPool = winningPool + losingPool;
   const stakes = bet.stakes ?? {};
-
-  // Nobody backed the winning side → refund everyone their stake.
-  if (winningPool === 0) {
-    const payouts = [];
-    for (const [userId, s] of Object.entries(stakes)) {
-      const refund = (s.win ?? 0) + (s.loss ?? 0);
-      if (refund > 0) {
-        payouts.push({ discordUserId: userId, amount: refund, kind: 'refund' });
-      }
-    }
-    return {
-      payouts,
-      totalPaid: payouts.reduce((sum, p) => sum + p.amount, 0),
-      refund: true,
-    };
-  }
 
   // Hybrid: stake × locked base multiplier (floor) + proportional share of
   // losing pool (bonus). Solo voters still come out ahead via the base mult.
   const baseMult = bet.multipliers?.[winningSide] ?? 1.0;
   const payouts = [];
+  const losers = [];
   for (const [userId, s] of Object.entries(stakes)) {
+    const stakeOnLoser = s?.[losingSide] ?? 0;
+    if (stakeOnLoser > 0) losers.push({ discordUserId: userId, amount: stakeOnLoser });
+
     const stakeOnWinner = s?.[winningSide] ?? 0;
     if (stakeOnWinner === 0) continue;
     const base = stakeOnWinner * baseMult;
@@ -343,27 +331,35 @@ export function computeBetPayouts(bet, winningSide) {
   }
   return {
     payouts,
+    losers,
     totalPaid: payouts.reduce((sum, p) => sum + p.amount, 0),
-    refund: false,
   };
 }
 
 /**
- * Channel message when a bet resolves. Lists the winners' payouts inline.
+ * Channel message when a bet resolves. Lists winners' payouts and losers'
+ * forfeited stakes inline.
  */
-export function buildBetResolvedMessage(bet, winningSide, payouts) {
+export function buildBetResolvedMessage(bet, winningSide, payouts, losers = []) {
   const target = bet.targetDiscordId ? `<@${bet.targetDiscordId}>` : `**${bet.displayName}**`;
   const verdict = winningSide === 'win' ? '✅ WIN' : '❌ LOSS';
-  const totalPool = (bet.pools?.win ?? 0) + (bet.pools?.loss ?? 0);
+  const header = `🎲 Prediction resolved: ${target} → ${verdict}`;
 
-  if (payouts.length === 0) {
-    return `🎲 Prediction resolved: ${target} → ${verdict}\nNobody had a stake. The void claims ${totalPool.toLocaleString()} souls.`;
+  if (payouts.length === 0 && losers.length === 0) {
+    return `${header}\nNobody had a stake.`;
   }
 
   const lines = payouts.map(
     (p) => `  • <@${p.discordUserId}> +${p.amount.toLocaleString()} souls`,
   );
-  return `🎲 Prediction resolved: ${target} → ${verdict}\n${lines.join('\n')}`;
+  if (payouts.length === 0) {
+    const lost = losers.reduce((sum, l) => sum + l.amount, 0);
+    lines.push(`Nobody called it. The void claims ${lost.toLocaleString()} souls.`);
+  }
+  for (const l of losers) {
+    lines.push(`  • <@${l.discordUserId}> -${l.amount.toLocaleString()} souls`);
+  }
+  return `${header}\n${lines.join('\n')}`;
 }
 
 /**
@@ -386,11 +382,16 @@ export function buildBetRefundedMessage(bet, reason, payouts) {
  * 0-100 "undeserved win" score. Returns null on losses or when essential
  * inputs are missing — caller should treat null as "no fraud signal".
  *
- * Composite of four signals capped at 100:
+ * Composite of signals capped at 100:
  *   - damage share (max 30)
  *   - kill participation (max 30)
  *   - KDA (max 25)
  *   - turret damage share (max 15)
+ *   - KDA padding: high KDA on low damage share (max 20)
+ *   - timeline: disappeared after 20:00 (max 15)
+ *   - timeline: tower deaths (max 10)
+ *   - timeline: skipped big fights (max 20)
+ * `timeline` is the analyzeTimeline() result, or null when unavailable.
  */
 export function computeFraudScore({
   won,
@@ -398,8 +399,11 @@ export function computeFraudScore({
   deaths,
   assists,
   damageShare,
+  damageRankOnTeam,
+  teamSize,
   killParticipation,
   turretDamageShare,
+  timeline = null,
 } = {}) {
   if (!won) return null;
   if (!Number.isFinite(kills) || !Number.isFinite(deaths) || !Number.isFinite(assists)) {
@@ -431,7 +435,80 @@ export function computeFraudScore({
     else if (turretDamageShare < 0.08) score += 7;
   }
 
+  // A good-looking KDA that came from cleanup assists, not damage. Stacks on
+  // top of the damage-share points above — padding is its own crime.
+  if (isKdaPadding({ kda, damageShare, damageRankOnTeam, teamSize })) {
+    score += damageShare < 0.15 ? 20 : 10;
+  }
+
+  const lateShare = timeline?.lateDamageShare;
+  if (Number.isFinite(lateShare)) {
+    if (lateShare < 0.08)      score += 15;
+    else if (lateShare < 0.12) score += 8;
+  }
+
+  const towerDeaths = timeline?.towerDeaths ?? 0;
+  if (towerDeaths >= 2)       score += 10;
+  else if (towerDeaths === 1) score += 5;
+
+  const missedShare = missedBigFightShare(timeline);
+  if (missedShare !== null) {
+    if (missedShare >= 0.75)     score += 20;
+    else if (missedShare >= 0.5) score += 10;
+  }
+
   return Math.min(100, score);
+}
+
+// KDA ≥ 4 while dealing under 15% of team damage, or under 18% and the
+// lowest damage on the team.
+function isKdaPadding({ kda, damageShare, damageRankOnTeam, teamSize }) {
+  if (kda < 4 || !Number.isFinite(damageShare)) return false;
+  if (damageShare < 0.15) return true;
+  return damageShare < 0.18 && damageRankOnTeam === teamSize;
+}
+
+// Share of big fights (4+ kills) the player wasn't in, or null when the game
+// had fewer than 2 big fights — one skipped fight isn't a pattern.
+function missedBigFightShare(timeline) {
+  const total = timeline?.bigFights ?? 0;
+  if (total < 2) return null;
+  return 1 - (timeline.bigFightsJoined ?? 0) / total;
+}
+
+/**
+ * Timeline-backed evidence lines appended to Fraud Watch. Only lists receipts
+ * that actually look bad, so a clean timeline adds nothing.
+ */
+function buildFraudReceipts(summary, timeline) {
+  const receipts = [];
+  const { kills, deaths, assists, damageShare, damageRankOnTeam, teamSize } = summary;
+  const kda = (kills + assists) / Math.max(deaths, 1);
+  if (isKdaPadding({ kda, damageShare, damageRankOnTeam, teamSize })) {
+    const lowest = damageRankOnTeam === teamSize ? ' (lowest on team)' : '';
+    receipts.push(
+      `🧮 KDA padder: ${kda.toFixed(1)} KDA on ${Math.round(damageShare * 100)}% damage${lowest}`,
+    );
+  }
+
+  if (!timeline) return receipts;
+  const missedShare = missedBigFightShare(timeline);
+  if (missedShare !== null && missedShare >= 0.5) {
+    receipts.push(
+      `⚔️ Showed up to ${timeline.bigFightsJoined} of ${timeline.bigFights} big fights`,
+    );
+  }
+
+  const { lateDamageShare, damageAt20, lateDamage, towerDeaths } = timeline;
+  if (Number.isFinite(lateDamageShare) && lateDamageShare < 0.12) {
+    receipts.push(
+      `📉 ${damageAt20.toLocaleString()} dmg by 20:00, only ${lateDamage.toLocaleString()} after (${Math.round(lateDamageShare * 100)}% of team) — fell off and got carried`,
+    );
+  }
+  if (towerDeaths > 0) {
+    receipts.push(`🗼 Executed by tower ${towerDeaths === 1 ? 'once' : `${towerDeaths} times`}`);
+  }
+  return receipts;
 }
 
 /**
@@ -439,14 +516,108 @@ export function computeFraudScore({
  * fraud threshold. Includes the score and the underlying stats so the chat
  * can roast them with evidence.
  */
-export function buildFraudWatchMessage(displayToken, fraudScore, summary) {
+export function buildFraudWatchMessage(displayToken, fraudScore, summary, timeline = null) {
+  const lines = [
+    '🚨 FRAUD WATCH 🚨',
+    `${displayToken} got carried this game — Fraud Score: ${fraudScore}%`,
+    formatStatLine(summary),
+    ...buildFraudReceipts(summary, timeline),
+  ];
+  return lines.join('\n');
+}
+
+function formatStatLine(summary) {
   const { kills, deaths, assists, damageShare, killParticipation, turretDamageShare } = summary;
-  const kda = `${kills}/${deaths}/${assists}`;
-  const stats = [kda];
+  const stats = [`${kills}/${deaths}/${assists}`];
   if (Number.isFinite(damageShare)) stats.push(`${Math.round(damageShare * 100)}% dmg`);
   if (Number.isFinite(killParticipation)) stats.push(`${Math.round(killParticipation * 100)}% KP`);
   if (Number.isFinite(turretDamageShare)) stats.push(`${Math.round(turretDamageShare * 100)}% turret dmg`);
-  return `🚨 FRAUD WATCH 🚨\n${displayToken} got carried this game — Fraud Score: ${fraudScore}%\n${stats.join(' • ')}`;
+  return stats.join(' • ');
+}
+
+// --- God Mode / Flow State -------------------------------------------------
+
+/**
+ * 0-100 "actually popped off" score — the mirror image of Fraud Watch. Works
+ * on wins and losses (a god-mode game the team threw still deserves credit).
+ *
+ * Composite of signals capped at 100:
+ *   - damage share (max 25)
+ *   - kill participation (max 20)
+ *   - KDA (max 25, needs 5+ takedowns so 0/0/2 games don't count)
+ *   - turret damage share (max 10)
+ *   - timeline: long deathless stretch with takedowns (max 20)
+ */
+export function computeGodModeScore({
+  kills,
+  deaths,
+  assists,
+  damageShare,
+  killParticipation,
+  turretDamageShare,
+  timeline = null,
+} = {}) {
+  if (!Number.isFinite(kills) || !Number.isFinite(deaths) || !Number.isFinite(assists)) {
+    return null;
+  }
+
+  let score = 0;
+
+  if (Number.isFinite(damageShare)) {
+    if (damageShare >= 0.35)      score += 25;
+    else if (damageShare >= 0.30) score += 18;
+    else if (damageShare >= 0.25) score += 10;
+  }
+
+  if (Number.isFinite(killParticipation)) {
+    if (killParticipation >= 0.75)      score += 20;
+    else if (killParticipation >= 0.65) score += 12;
+    else if (killParticipation >= 0.55) score += 6;
+  }
+
+  if (kills + assists >= 5) {
+    const kda = (kills + assists) / Math.max(deaths, 1);
+    if (kda >= 10)     score += 25;
+    else if (kda >= 6) score += 16;
+    else if (kda >= 4) score += 8;
+  }
+
+  if (Number.isFinite(turretDamageShare)) {
+    if (turretDamageShare >= 0.40)      score += 10;
+    else if (turretDamageShare >= 0.25) score += 5;
+  }
+
+  const flow = timeline?.flow;
+  if (flow) {
+    if (flow.minutes >= 20 && flow.takedowns >= 6)      score += 20;
+    else if (flow.minutes >= 15 && flow.takedowns >= 4) score += 12;
+  }
+
+  return Math.min(100, score);
+}
+
+export const GOD_MODE_THRESHOLD = 80;
+export const FLOW_STATE_THRESHOLD = 60;
+
+/**
+ * ⚡ GOD MODE ⚡ (score ≥ 80) or 🌊 FLOW STATE 🌊 (score ≥ 60) message.
+ * Caller is responsible for the threshold check.
+ */
+export function buildGodModeMessage(displayToken, score, summary, timeline = null) {
+  const godMode = score >= GOD_MODE_THRESHOLD;
+  const header = godMode ? '⚡ GOD MODE ⚡' : '🌊 FLOW STATE 🌊';
+  const verb = godMode ? 'ascended this game' : 'was locked in this game';
+  const lines = [
+    header,
+    `${displayToken} ${verb} — ${godMode ? 'God' : 'Flow'} Score: ${score}%`,
+    formatStatLine(summary),
+  ];
+  const flow = timeline?.flow;
+  if (flow && flow.minutes >= 15 && flow.takedowns >= 4) {
+    lines.push(`🧘 ${flow.minutes} minutes without dying, ${flow.takedowns} takedowns in that stretch`);
+  }
+  if (!summary.won) lines.push('...and the team still lost it 💀');
+  return lines.join('\n');
 }
 
 /**

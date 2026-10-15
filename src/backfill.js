@@ -38,6 +38,7 @@ export async function backfillTodayMatches(puuid) {
     const matchDate = rank.dateKeyForTimestamp(gameEndTimestamp ?? gameStartTimestamp, config.timezone);
 
     if (matchDate !== todayKey) break;
+    if (summary.remake) continue; // remakes don't count toward streak/record
     todayMatches.push(summary);
   }
 

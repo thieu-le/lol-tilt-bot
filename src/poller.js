@@ -26,12 +26,17 @@ import {
   buildCurseLossMessage,
   computeFraudScore,
   buildFraudWatchMessage,
+  computeGodModeScore,
+  buildGodModeMessage,
+  FLOW_STATE_THRESHOLD,
   buildBetPoolMessage,
   buildBetResolvedMessage,
   buildBetRefundedMessage,
   computeBetPayouts,
   computeBetMultiplier,
 } from './messages.js';
+import { analyzeTimeline, buildReportSeries } from './timeline.js';
+import { buildMatchReport } from './report.js';
 import { buildStakeButtons } from './commands.js';
 import { logger } from './logger.js';
 import { config } from './config.js';
@@ -105,6 +110,25 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     return;
   }
 
+  // Remakes don't count: no streak/record change, no tilt or win message, no
+  // souls, curses untouched. Any open bet on the game is voided and refunded.
+  if (summary.remake) {
+    logger.info(
+      `Match ${matchId} for ${player.riotId.gameName}#${player.riotId.tagLine} was a remake — not counted`,
+    );
+    await storage.updatePlayer(player.puuid, { lastProcessedMatchId: matchId });
+    const remakeBet = storage.getBetByGameId(String(matchId).split('_').pop());
+    if (
+      remakeBet &&
+      (remakeBet.status === 'open' || remakeBet.status === 'awaiting_resolve') &&
+      !silent
+    ) {
+      await lockBetMessage(remakeBet, channel);
+      await refundBet(remakeBet, 'game was remade', channel);
+    }
+    return;
+  }
+
   const newStreak = nextStreak(player.streak, won);
   const newToday = nextToday(player.today, won, config.timezone);
 
@@ -169,6 +193,22 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     damageShare,
   };
 
+  // Timeline feeds the post-match report chart plus the Fraud Watch / God Mode
+  // signals (fall-off, tower deaths, fights, deathless stretches). One extra
+  // request per live match; on failure the report is embed-only and the
+  // detectors run on end-of-game stats alone.
+  let timeline = null;
+  let reportSeries = null;
+  if (!silent) {
+    try {
+      const rawTimeline = await riot.getMatchTimeline(matchId);
+      timeline = analyzeTimeline(rawTimeline, player.puuid);
+      reportSeries = buildReportSeries(rawTimeline, match, player.puuid);
+    } catch (err) {
+      logger.warn(`Failed to fetch timeline for ${matchId}: ${err.message}`);
+    }
+  }
+
   let text = null;
 
   if (!won) {
@@ -192,13 +232,9 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     }
   }
 
-  if (text && !silent) {
-    try {
-      await channel.send({ content: text, allowedMentions });
-    } catch (err) {
-      logger.error(`Failed to post message: ${err.message}`);
-    }
-  }
+  // Everything this game produces (result, Aegis, Fraud Watch, God Mode,
+  // curses, bet payouts) goes into ONE post, sent at the end of this function.
+  const sections = [text];
 
   // Participation payout — +100 souls every ranked match played. Gated by
   // !silent so backfill / catch-up after restart don't retroactively mint
@@ -214,39 +250,38 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   // Aegis Double LP — the +38/+40 LP blessing event. Anything above the
   // normal 20-28 LP range almost always means an Aegis or first-win bonus.
   if (!silent && won && Number.isFinite(lpDeltaNum) && lpDeltaNum >= 30) {
-    try {
-      await channel.send({
-        content: `🛡️ The Tilt Gods have blessed ${displayToken} with double LP — **${lpDeltaStr}** from Aegis 🙏`,
-        allowedMentions: player.discordUserId
-          ? { users: [player.discordUserId] }
-          : { parse: [] },
-      });
-    } catch (err) {
-      logger.error(`Failed to post Aegis blessing: ${err.message}`);
-    }
+    sections.push(
+      `🛡️ The Tilt Gods have blessed ${displayToken} with double LP — **${lpDeltaStr}** from Aegis 🙏`,
+    );
   }
+
+  const performance = {
+    kills,
+    deaths,
+    assists,
+    damageShare,
+    damageRankOnTeam: summary.damageRankOnTeam,
+    teamSize: summary.teamSize,
+    killParticipation,
+    turretDamageShare,
+    timeline,
+  };
 
   // Fraud Watch — independent of the standard win message. Only fires when a
   // win is statistically suspicious (low damage share, low KP, bad KDA, etc.).
   if (!silent && won) {
-    const fraudScore = computeFraudScore({
-      won,
-      kills,
-      deaths,
-      assists,
-      damageShare,
-      killParticipation,
-      turretDamageShare,
-    });
+    const fraudScore = computeFraudScore({ won, ...performance });
     if (Number.isFinite(fraudScore) && fraudScore >= 50) {
-      try {
-        await channel.send({
-          content: buildFraudWatchMessage(displayToken, fraudScore, summary),
-          allowedMentions: { parse: [] },
-        });
-      } catch (err) {
-        logger.error(`Failed to post fraud watch message: ${err.message}`);
-      }
+      sections.push(buildFraudWatchMessage(displayToken, fraudScore, summary, timeline));
+    }
+  }
+
+  // God Mode / Flow State — the opposite of Fraud Watch. Fires on wins and
+  // losses when the player genuinely popped off.
+  if (!silent) {
+    const godScore = computeGodModeScore(performance);
+    if (Number.isFinite(godScore) && godScore >= FLOW_STATE_THRESHOLD) {
+      sections.push(buildGodModeMessage(displayToken, godScore, summary, timeline));
     }
   }
 
@@ -280,17 +315,7 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
       curseText = buildCurseLossMessage(displayToken, awards);
     }
 
-    const targetMentions = player.discordUserId ? [player.discordUserId] : [];
-    try {
-      await channel.send({
-        content: curseText,
-        allowedMentions: targetMentions.length > 0
-          ? { users: targetMentions }
-          : { parse: [] },
-      });
-    } catch (err) {
-      logger.error(`Failed to post curse message: ${err.message}`);
-    }
+    sections.push(curseText);
 
     if (won) {
       await storage.updatePlayer(player.puuid, { cursers: [] });
@@ -302,16 +327,106 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   const gameIdForBet = String(matchId).split('_').pop();
   const bet = storage.getBetByGameId(gameIdForBet);
   if (bet && (bet.status === 'open' || bet.status === 'awaiting_resolve') && !silent) {
-    await resolveBet(bet, won ? 'win' : 'loss', channel);
+    sections.push(await resolveBet(bet, won ? 'win' : 'loss', channel));
+  }
+
+  if (!silent) {
+    await postGameReport(player, summary, {
+      channel,
+      content: sections.filter(Boolean).join('\n\n'),
+      allowedMentions,
+      report: buildMatchReport(summary, reportSeries, logger),
+      lpDelta: lpDeltaStr,
+    });
+  }
+}
+
+// Discord's hard cap on message content.
+const MAX_CONTENT = 2000;
+// How many earlier games to list in the "Earlier today" line before "+N more".
+const EARLIER_TODAY_SHOWN = 8;
+
+function formatEarlierToday(games) {
+  if (!games.length) return null;
+  const shown = games.slice(-EARLIER_TODAY_SHOWN).map(
+    (g) => `${g.won ? '✅' : '❌'} ${g.champion} ${g.kda}${g.lp ? ` (${g.lp})` : ''}`,
+  );
+  const hidden = games.length - shown.length;
+  return `📅 Earlier today: ${hidden > 0 ? `+${hidden} more • ` : ''}${shown.join(' • ')}`;
+}
+
+/**
+ * Post the single per-game message, keeping the channel to ONE live post per
+ * player per day: the player's previous post from today is deleted and the
+ * new one carries an "Earlier today" line, so nothing is lost but grinding
+ * ten games doesn't bury the channel.
+ */
+async function postGameReport(player, summary, { channel, content, allowedMentions, report, lpDelta }) {
+  const todayKey = rank.dateKey(config.timezone);
+  const prev = player.dayPosts?.date === todayKey ? player.dayPosts : null;
+  const earlierGames = prev?.games ?? [];
+
+  const earlierLine = formatEarlierToday(earlierGames);
+  let fullContent = earlierLine ? `${content}\n\n${earlierLine}` : content;
+  if (fullContent.length > MAX_CONTENT) fullContent = `${fullContent.slice(0, MAX_CONTENT - 1)}…`;
+
+  let sent = null;
+  try {
+    sent = await channel.send({ content: fullContent, allowedMentions, ...report });
+  } catch (err) {
+    logger.error(`Failed to post game report: ${err.message}`);
+  }
+
+  // Only remove the old post once the new one is safely up.
+  if (sent && prev?.messageId) {
+    try {
+      await channel.messages.delete(prev.messageId);
+    } catch (err) {
+      logger.warn(`Failed to delete previous post ${prev.messageId}: ${err.message}`);
+    }
+  }
+
+  await storage.updatePlayer(player.puuid, {
+    dayPosts: {
+      date: todayKey,
+      messageId: sent?.id ?? prev?.messageId ?? null,
+      games: [
+        ...earlierGames,
+        {
+          won: summary.won,
+          champion: summary.championName,
+          kda: `${summary.kills}/${summary.deaths}/${summary.assists}`,
+          lp: lpDelta ?? null,
+        },
+      ],
+    },
+  });
+}
+
+/** Strip the stake buttons from a bet's channel message and show it locked. */
+async function lockBetMessage(bet, channel) {
+  if (!bet.channelMessageId) return;
+  try {
+    const msg = await channel.messages.fetch(bet.channelMessageId);
+    await msg.edit({
+      content: buildBetPoolMessage(bet, { locked: true }),
+      components: [],
+    });
+  } catch (err) {
+    logger.warn(`Failed to lock bet message ${bet.channelMessageId}: ${err.message}`);
   }
 }
 
 /**
- * Pay out a bet and lock its channel message. Awards souls to each winner via
- * the existing storage.awardSouls path so totalEarned counts these too.
+ * Pay out a bet. Awards souls to each winner via the existing
+ * storage.awardSouls path so totalEarned counts these too. Stakes on the
+ * losing side are forfeited — including when nobody backed the winning side.
+ *
+ * Returns the result text for the caller to fold into the game post, and
+ * deletes the now-finished pool post so it doesn't linger in the channel.
  */
 async function resolveBet(bet, winningSide, channel) {
-  const { payouts, refund } = computeBetPayouts(bet, winningSide);
+  const { payouts, losers, totalPaid } = computeBetPayouts(bet, winningSide);
   for (const p of payouts) {
     await storage.awardSouls(p.discordUserId, p.amount);
   }
@@ -321,33 +436,49 @@ async function resolveBet(bet, winningSide, channel) {
     resolvedAt: new Date().toISOString(),
   });
 
-  // Lock the original message (strip buttons, swap to locked content).
   if (bet.channelMessageId) {
     try {
-      const msg = await channel.messages.fetch(bet.channelMessageId);
-      await msg.edit({
-        content: buildBetPoolMessage(bet, { locked: true }),
-        components: [],
-      });
+      await channel.messages.delete(bet.channelMessageId);
     } catch (err) {
-      logger.warn(`Failed to lock bet message ${bet.channelMessageId}: ${err.message}`);
+      logger.warn(`Failed to delete bet pool post ${bet.channelMessageId}: ${err.message}`);
     }
   }
 
-  // Post the resolution announcement.
-  try {
-    const text = refund
-      ? buildBetRefundedMessage(bet, 'no one backed the winning side', payouts)
-      : buildBetResolvedMessage(bet, winningSide, payouts);
-    await channel.send({ content: text, allowedMentions: { parse: [] } });
-  } catch (err) {
-    logger.error(`Failed to post bet resolved message: ${err.message}`);
-  }
-
-  const totalPaid = payouts.reduce((s, p) => s + p.amount, 0);
   logger.info(
-    `Bet ${bet.gameId} resolved as ${winningSide} — ${payouts.length} payout(s) totaling ${totalPaid} souls${refund ? ' (refunded)' : ''}`,
+    `Bet ${bet.gameId} resolved as ${winningSide} — ${payouts.length} payout(s) totaling ${totalPaid} souls, ${losers.length} stake(s) forfeited`,
   );
+  return buildBetResolvedMessage(bet, winningSide, payouts, losers);
+}
+
+/**
+ * Void a bet: every stake returns to its owner. Used for remakes and for
+ * matches that never resolve.
+ */
+async function refundBet(bet, reason, channel) {
+  const payouts = Object.entries(bet.stakes ?? {})
+    .map(([userId, s]) => ({
+      discordUserId: userId,
+      amount: (s.win ?? 0) + (s.loss ?? 0),
+      kind: 'refund',
+    }))
+    .filter((p) => p.amount > 0);
+
+  for (const p of payouts) {
+    await storage.awardSouls(p.discordUserId, p.amount);
+  }
+  await storage.updateBet(bet.gameId, {
+    status: 'refunded',
+    resolvedAt: new Date().toISOString(),
+  });
+  try {
+    await channel.send({
+      content: buildBetRefundedMessage(bet, reason, payouts),
+      allowedMentions: { parse: [] },
+    });
+  } catch (err) {
+    logger.error(`Failed to post bet refund message: ${err.message}`);
+  }
+  logger.info(`Bet ${bet.gameId} refunded (${reason}) — ${payouts.length} refund(s)`);
 }
 
 // Betting closes 2 minutes after the in-game gameStartTime — measured from
@@ -488,32 +619,7 @@ async function refundStuckBets(channel) {
   for (const bet of stuck) {
     const opened = Date.parse(bet.openedAt ?? 0);
     if (!Number.isFinite(opened) || now - opened < STUCK_BET_TIMEOUT_MS) continue;
-
-    // Build refund list: every stake returns to its owner.
-    const payouts = Object.entries(bet.stakes ?? {})
-      .map(([userId, s]) => ({
-        discordUserId: userId,
-        amount: (s.win ?? 0) + (s.loss ?? 0),
-        kind: 'refund',
-      }))
-      .filter((p) => p.amount > 0);
-
-    for (const p of payouts) {
-      await storage.awardSouls(p.discordUserId, p.amount);
-    }
-    await storage.updateBet(bet.gameId, {
-      status: 'refunded',
-      resolvedAt: new Date().toISOString(),
-    });
-    try {
-      await channel.send({
-        content: buildBetRefundedMessage(bet, 'match never resolved (timeout)', payouts),
-        allowedMentions: { parse: [] },
-      });
-    } catch (err) {
-      logger.error(`Failed to post bet refund message: ${err.message}`);
-    }
-    logger.info(`Bet ${bet.gameId} refunded after timeout — ${payouts.length} refund(s)`);
+    await refundBet(bet, 'match never resolved (timeout)', channel);
   }
 }
 
@@ -782,7 +888,7 @@ async function processHatewatchEntry(entry, channel, { silent = false } = {}) {
       lastProcessed = matchId;
       continue;
     }
-    if (!rank.isRankedQueue(summary.queueId)) {
+    if (!rank.isRankedQueue(summary.queueId) || summary.remake) {
       lastProcessed = matchId;
       continue;
     }

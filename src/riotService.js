@@ -124,6 +124,16 @@ export async function getMatch(matchId) {
 }
 
 /**
+ * Fetch the per-minute timeline for a match (participant frames + events).
+ * Not every match has one, so callers should treat failures as "no timeline".
+ */
+export async function getMatchTimeline(matchId) {
+  const path = `/lol/match/v5/matches/${encodeURIComponent(matchId)}/timeline`;
+  const { data } = await http.get(path);
+  return data;
+}
+
+/**
  * Extract the fields we care about for a given player out of a match payload.
  * Returns null if the player isn't a participant — shouldn't happen for
  * matches surfaced by their own match-id list, but we guard rather than throw.
@@ -147,6 +157,12 @@ export function extractMatchSummary(match, puuid) {
   );
   const playerDamage = p.totalDamageDealtToChampions ?? 0;
   const damageShare = teamDamage > 0 ? playerDamage / teamDamage : null;
+  // 1 = most champion damage on the team, sameTeam.length = least.
+  const damageRankOnTeam =
+    1 + sameTeam.filter((x) => (x.totalDamageDealtToChampions ?? 0) > playerDamage).length;
+  // Same idea for gold and kills — rank 1 means "the team's carry" this game.
+  const goldRankOnTeam = 1 + sameTeam.filter((x) => (x.goldEarned ?? 0) > (p.goldEarned ?? 0)).length;
+  const killRankOnTeam = 1 + sameTeam.filter((x) => (x.kills ?? 0) > (p.kills ?? 0)).length;
 
   const teamKills = sameTeam.reduce((sum, x) => sum + (x.kills ?? 0), 0);
   const killParticipation = teamKills > 0
@@ -164,16 +180,32 @@ export function extractMatchSummary(match, puuid) {
   return {
     matchId: match.metadata?.matchId ?? null,
     won: Boolean(p.win),
+    // Riot doesn't always set gameEndedInEarlySurrender on remakes (seen on a
+    // 3:14 remake flagged as a plain surrender). A normal surrender can't
+    // happen before 15:00, so any earlier surrender is a remake.
+    remake: Boolean(
+      p.gameEndedInEarlySurrender ||
+        (p.gameEndedInSurrender && (match.info?.gameDuration ?? Infinity) < 15 * 60),
+    ),
     kills: p.kills ?? 0,
     deaths: p.deaths ?? 0,
     assists: p.assists ?? 0,
     championName: p.championName ?? 'Unknown',
+    teamPosition: p.teamPosition || null,
+    cs: (p.totalMinionsKilled ?? 0) + (p.neutralMinionsKilled ?? 0),
+    goldEarned: p.goldEarned ?? 0,
+    visionScore: p.visionScore ?? 0,
+    largestMultiKill: p.largestMultiKill ?? 0,
     queueId: match.info?.queueId ?? null,
     gameStartTimestamp: match.info?.gameStartTimestamp ?? null,
     gameEndTimestamp: match.info?.gameEndTimestamp ?? null,
     gameDuration: match.info?.gameDuration ?? null,
     totalDamageDealtToChampions: playerDamage,
     damageShare,
+    damageRankOnTeam,
+    goldRankOnTeam,
+    killRankOnTeam,
+    teamSize: sameTeam.length,
     killParticipation,
     turretDamageShare,
   };
