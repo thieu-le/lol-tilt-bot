@@ -21,10 +21,20 @@ export const DIVISION_ORDER = ['IV', 'III', 'II', 'I'];
 
 const APEX_TIERS = new Set(['MASTER', 'GRANDMASTER', 'CHALLENGER']);
 
-// Queue ID -> Riot queueType string used in league-v4 entries.
+// Queue ID -> Riot queueType string used in league-v4 entries. 710 is
+// Ranked 5s (full premade teams) — it has its own ladder, separate from
+// Solo/Duo and Flex.
 const QUEUE_ID_TO_TYPE = {
   420: 'RANKED_SOLO_5x5',
   440: 'RANKED_FLEX_SR',
+  710: 'RANKED_PREMADE_5x5',
+};
+
+// Suffix on rank labels so "Master 0 LP" says which ladder it's on. Solo/Duo
+// is the default and stays unlabeled.
+const QUEUE_TYPE_TAG = {
+  RANKED_FLEX_SR: 'Flex',
+  RANKED_PREMADE_5x5: '5s',
 };
 
 export function isRankedQueue(queueId) {
@@ -60,10 +70,30 @@ export function entryToSnapshot(entry) {
 export function formatRank(snapshot) {
   if (!snapshot) return null;
   const tierTitle = snapshot.tier.charAt(0) + snapshot.tier.slice(1).toLowerCase();
+  const tag = QUEUE_TYPE_TAG[snapshot.queueType];
+  const suffix = tag ? ` (${tag})` : '';
   if (APEX_TIERS.has(snapshot.tier)) {
-    return `${tierTitle} ${snapshot.leaguePoints} LP`;
+    return `${tierTitle} ${snapshot.leaguePoints} LP${suffix}`;
   }
-  return `${tierTitle} ${snapshot.division} ${snapshot.leaguePoints} LP`;
+  return `${tierTitle} ${snapshot.division} ${snapshot.leaguePoints} LP${suffix}`;
+}
+
+/**
+ * The record's last snapshot for one ladder. Records keep a snapshot per
+ * queueType in `lastRanks` so alternating Solo/Duo and 5s doesn't lose the LP
+ * baseline; older records only have the single `lastRank`, used when it's
+ * the same queue.
+ */
+export function previousSnapshot(record, queueType) {
+  return (
+    record?.lastRanks?.[queueType] ??
+    (record?.lastRank?.queueType === queueType ? record.lastRank : null)
+  );
+}
+
+/** `lastRanks` with `snapshot` stored under its queueType. */
+export function withSnapshot(record, snapshot) {
+  return { ...(record?.lastRanks ?? {}), [snapshot.queueType]: snapshot };
 }
 
 /**

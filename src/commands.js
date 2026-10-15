@@ -217,6 +217,7 @@ const QUEUE_NAMES = {
   420: 'Ranked Solo/Duo',
   430: 'Normal Blind',
   440: 'Ranked Flex',
+  710: 'Ranked 5s',
   450: 'ARAM',
   490: 'Quickplay',
   700: 'Clash',

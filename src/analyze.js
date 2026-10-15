@@ -29,7 +29,7 @@ const MAX_CANDIDATES = 5;
 const EMBED_CHARS_PER_MESSAGE = 5500;
 const EMBEDS_PER_MESSAGE = 10;
 
-const QUEUE_LABELS = { 420: 'Ranked Solo/Duo', 440: 'Ranked Flex' };
+const QUEUE_LABELS = { 420: 'Ranked Solo/Duo', 440: 'Ranked Flex', 710: 'Ranked 5s' };
 
 /** Numeric tail of "NA1_5659600977", for newest-first sorting. */
 function matchNumber(matchId) {

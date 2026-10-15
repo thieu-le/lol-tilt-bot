@@ -45,7 +45,7 @@ export async function backfillTodayMatches(puuid) {
   // Reverse to chronological order so streak/today accumulate correctly.
   todayMatches.reverse();
 
-  let { streak, today, wins, losses, lastRank } = player;
+  let { streak, today, wins, losses, lastRank, lastRanks } = player;
 
   for (const summary of todayMatches) {
     const { won } = summary;
@@ -61,7 +61,10 @@ export async function backfillTodayMatches(puuid) {
     try {
       const entries = await riot.getRankedEntries(puuid);
       const entry = rank.findEntryForQueue(entries, mostRecent.queueId);
-      if (entry) lastRank = rank.entryToSnapshot(entry);
+      if (entry) {
+        lastRank = rank.entryToSnapshot(entry);
+        lastRanks = rank.withSnapshot({ lastRanks }, lastRank);
+      }
     } catch (err) {
       logger.warn(`Backfill: failed to fetch rank for ${puuid}: ${err.message}`);
     }
@@ -74,6 +77,7 @@ export async function backfillTodayMatches(puuid) {
     wins,
     losses,
     lastRank,
+    lastRanks,
   });
 
   logger.info(

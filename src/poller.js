@@ -143,20 +143,23 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
   let lpDeltaNum = null;
   let rankLabel = null;
   let newLastRank = player.lastRank ?? null;
+  let newLastRanks = player.lastRanks ?? {};
   let rankChange = null;
   try {
     const entries = await riot.getRankedEntries(player.puuid);
     const entry = rank.findEntryForQueue(entries, queueId);
     if (entry) {
       const snapshot = rank.entryToSnapshot(entry);
-      rankChange = rank.getRankChange(player.lastRank, snapshot);
-      if (player.lastRank && player.lastRank.queueType === snapshot.queueType) {
-        lpDeltaNum = rank.computeLpDelta(player.lastRank, snapshot);
+      const prev = rank.previousSnapshot(player, snapshot.queueType);
+      rankChange = rank.getRankChange(prev, snapshot);
+      if (prev) {
+        lpDeltaNum = rank.computeLpDelta(prev, snapshot);
         lpDeltaStr = rank.formatLpDelta(lpDeltaNum);
         if (lpDeltaNum !== null) newToday.lpDelta = (newToday.lpDelta ?? 0) + lpDeltaNum;
       }
       rankLabel = rank.formatRank(snapshot);
       newLastRank = snapshot;
+      newLastRanks = rank.withSnapshot(player, snapshot);
     }
   } catch (err) {
     logger.warn(`Failed to fetch ranked entries for ${player.puuid}: ${err.message}`);
@@ -171,6 +174,7 @@ async function processMatch(player, matchId, channel, { silent = false } = {}) {
     streak: newStreak,
     today: newToday,
     lastRank: newLastRank,
+    lastRanks: newLastRanks,
     wins: player.wins + (won ? 1 : 0),
     losses: player.losses + (won ? 0 : 1),
     recentResults: newRecentResults,
@@ -976,6 +980,7 @@ async function processHatewatchEntry(entry, channel, { silent = false } = {}) {
 
   let streak = entry.streak ?? { type: null, count: 0 };
   let lastRank = entry.lastRank ?? null;
+  let lastRanks = entry.lastRanks ?? {};
   let lastProcessed = entry.lastProcessedMatchId;
 
   for (const matchId of newIds) {
@@ -1008,8 +1013,9 @@ async function processHatewatchEntry(entry, channel, { silent = false } = {}) {
       const queueEntry = rank.findEntryForQueue(entries, summary.queueId);
       if (queueEntry) {
         const snapshot = rank.entryToSnapshot(queueEntry);
-        rankChange = rank.getRankChange(lastRank, snapshot);
+        rankChange = rank.getRankChange(rank.previousSnapshot({ lastRank, lastRanks }, snapshot.queueType), snapshot);
         newRank = snapshot;
+        lastRanks = rank.withSnapshot({ lastRanks }, snapshot);
       }
     } catch (err) {
       logger.warn(`HateWatch rank fetch error: ${err.message}`);
@@ -1046,6 +1052,7 @@ async function processHatewatchEntry(entry, channel, { silent = false } = {}) {
     lastProcessedMatchId: lastProcessed,
     streak,
     lastRank,
+    lastRanks,
   });
 }
 

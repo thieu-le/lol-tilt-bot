@@ -228,8 +228,8 @@ export async function getRankedEntries(puuid) {
  * propagate. The endpoint is platform-routed.
  *
  * Payload of interest: { gameId, gameQueueConfigId, gameStartTime, mapId, ... }
- * - gameQueueConfigId 420 = Ranked Solo, 440 = Ranked Flex; everything else
- *   is unranked and the bet system ignores it.
+ * - gameQueueConfigId 420 = Ranked Solo, 440 = Ranked Flex, 710 = Ranked 5s;
+ *   everything else is unranked and the bet system ignores it.
  */
 export async function getActiveGame(puuid) {
   const path = `/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
