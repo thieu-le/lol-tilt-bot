@@ -311,6 +311,28 @@ export async function upsertSquadPost(matchId, patch) {
   return structuredClone(post);
 }
 
+/** Squad posts whose vote is still open. */
+export function getOpenSquadVotes() {
+  ensureReady();
+  return (db.data.squadPosts ?? [])
+    .filter((x) => x.vote && !x.vote.closed)
+    .map((x) => structuredClone(x));
+}
+
+/**
+ * Record one voter's pick in one category. Returns the updated post, or null
+ * if the post or its vote is gone/closed.
+ */
+export async function recordSquadBallot(matchId, voterId, category, pick) {
+  ensureReady();
+  const post = db.data.squadPosts?.find((x) => x.matchId === matchId);
+  if (!post?.vote || post.vote.closed) return null;
+  post.vote.ballots ||= {};
+  post.vote.ballots[voterId] = { ...post.vote.ballots[voterId], [category]: pick };
+  await db.write();
+  return structuredClone(post);
+}
+
 // --- HateWatch (loss-streak + demotion watchlist for any Riot ID) ----------
 
 export function getHatewatch() {

@@ -43,6 +43,9 @@ import {
   buildSquadHeader,
   buildSquadScoreboard,
   renderSquadPost,
+  buildVoteRoster,
+  summarizeVote,
+  SQUAD_VOTE_WINDOW_MS,
 } from './squad.js';
 import { buildStakeButtons } from './commands.js';
 import { logger } from './logger.js';
@@ -395,10 +398,19 @@ async function postSquadSection(player, summary, { channel, match, matchId, rawT
   const todayKey = rank.dateKey(config.timezone);
   const verdict = computeSquadVerdict(match, squad.teamId, rawTimeline);
   const prev = storage.getLatestSquadPost(squad.key, todayKey, matchId);
-  const history = [...(prev?.history ?? []), ...(prev ? [prev.result] : [])];
+  // The previous game's vote ends here — its post is about to be replaced —
+  // and its verdict rides along in the earlier-today line.
+  const prevResult = prev ? { ...prev.result, vote: prev.vote ? summarizeVote(prev) : null } : null;
+  if (prev?.vote && !prev.vote.closed) {
+    await storage.upsertSquadPost(prev.matchId, { vote: { ...prev.vote, closed: true } });
+  }
+  const history = [...(prev?.history ?? []), ...(prevResult ? [prevResult] : [])];
   const earlierLine = history.length
-    ? `📅 Squad earlier today: ${history.map((r) => `${r.won ? '✅' : '❌'} carry ${r.carryChampion}`).join(' • ')}`
+    ? `📅 Squad earlier today: ${history
+        .map((r) => `${r.won ? '✅' : '❌'} carry ${r.carryChampion}${r.vote ? ` (${r.vote})` : ''}`)
+        .join(' • ')}`
     : null;
+  const squadIds = squad.members.map((m) => m.discordUserId).filter(Boolean);
 
   const post = await storage.upsertSquadPost(matchId, {
     squadKey: squad.key,
@@ -410,9 +422,17 @@ async function postSquadSection(player, summary, { channel, match, matchId, rawT
     history,
     result: { won: verdict.won, carryChampion: verdict.carry.participant.championName },
     memberSections: { [player.puuid]: { title, text: content } },
+    vote: squadIds.length
+      ? {
+          roster: buildVoteRoster(verdict, squad),
+          voters: squadIds,
+          ballots: {},
+          closesAt: new Date(Date.now() + SQUAD_VOTE_WINDOW_MS).toISOString(),
+          closed: false,
+        }
+      : null,
   });
 
-  const squadIds = squad.members.map((m) => m.discordUserId).filter(Boolean);
   let sent = null;
   try {
     sent = await channel.send({ ...renderSquadPost(post), allowedMentions: { users: squadIds } });
@@ -428,6 +448,26 @@ async function postSquadSection(player, summary, { channel, match, matchId, rawT
     } catch (err) {
       logger.warn(`Failed to delete previous squad post ${prev.messageId}: ${err.message}`);
     }
+  }
+}
+
+/**
+ * Close squad votes past their window: lock in the verdict and strip the
+ * vote menus from the post.
+ */
+async function closeExpiredSquadVotes(channel) {
+  const now = Date.now();
+  for (const post of storage.getOpenSquadVotes()) {
+    if (Date.parse(post.vote.closesAt) > now) continue;
+    const closed = await storage.upsertSquadPost(post.matchId, { vote: { ...post.vote, closed: true } });
+    if (!closed.messageId) continue;
+    try {
+      const msg = await channel.messages.fetch(closed.messageId);
+      await msg.edit({ ...renderSquadPost(closed), allowedMentions: { parse: [] } });
+    } catch (err) {
+      logger.warn(`Failed to close squad vote on ${closed.messageId}: ${err.message}`);
+    }
+    logger.info(`Squad vote closed for ${post.matchId}`);
   }
 }
 
@@ -940,6 +980,11 @@ async function spectatorTick(channel) {
       await closeBetsPastWindow(channel);
     } catch (err) {
       logger.error(`Failed to close bets past window: ${err.message}`);
+    }
+    try {
+      await closeExpiredSquadVotes(channel);
+    } catch (err) {
+      logger.error(`Failed to close squad votes: ${err.message}`);
     }
   } finally {
     spectatorRunning = false;

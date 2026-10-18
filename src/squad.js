@@ -4,7 +4,7 @@
 // a thrown loss who griefed it (see detectThrow), and collects each squadmate's own lines (tilt message,
 // Fraud Watch, curses, bets) as they're processed.
 
-import { EmbedBuilder } from 'discord.js';
+import { ActionRowBuilder, EmbedBuilder, StringSelectMenuBuilder } from 'discord.js';
 import { computeTrivia } from './timeline.js';
 
 // Tracked players on one team needed to count as a squad game.
@@ -274,13 +274,117 @@ export function buildSquadScoreboard(verdict, squad) {
     .join('\n');
 }
 
+// --- Squad vote -----------------------------------------------------------
+//
+// Every squad post carries a vote: the players in the game pick who griefed,
+// who inted and who tilted. Live tallies render on the post; the vote closes
+// after SQUAD_VOTE_WINDOW_MS or when the squad's next game replaces the post.
+
+export const SQUAD_VOTE_WINDOW_MS = 2 * 60 * 60 * 1000;
+export const VOTE_CATEGORIES = [
+  { key: 'griefed', emoji: '🚮', question: 'Who griefed?', title: 'Griefed' },
+  { key: 'inted', emoji: '💀', question: 'Who inted?', title: 'Inted' },
+  { key: 'tilted', emoji: '😤', question: 'Who tilted?', title: 'Tilted' },
+];
+export const VOTE_NOBODY = 'nobody';
+const VOTE_CUSTOM_ID_PREFIX = 'squadvote';
+
+/**
+ * The five teammates as vote options: [{ id, label }]. `id` is a short
+ * stable key (option values are capped at 100 chars, so no puuids).
+ */
+export function buildVoteRoster(verdict, squad) {
+  const trackedByPuuid = new Map(squad.members.map((m) => [m.puuid, m]));
+  return verdict.ranked.map((e, i) => {
+    const p = e.participant;
+    const name = trackedByPuuid.get(p.puuid)?.riotId?.gameName ?? p.riotIdGameName ?? 'Unknown';
+    return { id: String(i + 1), label: `${p.championName} — ${name}`.slice(0, 100) };
+  });
+}
+
+/** `squadvote:<matchId>:<category>` → { matchId, category } or null. */
+export function parseVoteCustomId(customId) {
+  const [prefix, matchId, category] = String(customId ?? '').split(':');
+  if (prefix !== VOTE_CUSTOM_ID_PREFIX || !matchId || !category) return null;
+  return { matchId, category };
+}
+
+/**
+ * Top pick per category: { [key]: { labels: [..], count } | null }. Ties
+ * list everyone tied; "Nobody" can win too. Null when nobody voted.
+ */
+export function voteWinners(post) {
+  const rosterById = new Map((post.vote?.roster ?? []).map((r) => [r.id, r.label]));
+  const winners = {};
+  for (const { key } of VOTE_CATEGORIES) {
+    const counts = new Map();
+    for (const ballot of Object.values(post.vote?.ballots ?? {})) {
+      const pick = ballot[key];
+      if (pick) counts.set(pick, (counts.get(pick) ?? 0) + 1);
+    }
+    const top = Math.max(0, ...counts.values());
+    winners[key] = top
+      ? {
+          count: top,
+          labels: [...counts]
+            .filter(([, n]) => n === top)
+            .map(([id]) => (id === VOTE_NOBODY ? 'Nobody' : rosterById.get(id) ?? '?')),
+        }
+      : null;
+  }
+  return winners;
+}
+
+function voteFieldValue(post) {
+  const winners = voteWinners(post);
+  const lines = VOTE_CATEGORIES.map(({ key, emoji, title }) => {
+    const w = winners[key];
+    if (!w) return `${emoji} ${title}: —`;
+    return `${emoji} ${title}: **${w.labels.join(' / ')}** (${w.count} vote${w.count === 1 ? '' : 's'})`;
+  });
+  const voted = Object.keys(post.vote?.ballots ?? {}).length;
+  const eligible = post.vote?.voters?.length ?? 0;
+  const closes = Math.floor(Date.parse(post.vote.closesAt) / 1000);
+  lines.push(
+    post.vote.closed
+      ? `${voted} of ${eligible} voted • voting closed`
+      : `${voted} of ${eligible} voted • closes <t:${closes}:R>`,
+  );
+  return lines.join('\n');
+}
+
+function buildVoteMenus(post) {
+  return VOTE_CATEGORIES.map(({ key, emoji, question }) =>
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`${VOTE_CUSTOM_ID_PREFIX}:${post.matchId}:${key}`)
+        .setPlaceholder(`${emoji} ${question}`)
+        .addOptions(
+          ...post.vote.roster.map((r) => ({ label: r.label, value: r.id })),
+          { label: 'Nobody', value: VOTE_NOBODY, emoji: '🙏' },
+        ),
+    ),
+  );
+}
+
+/** "voted griefer Vi — gayian" style summary for the earlier-today line. */
+export function summarizeVote(post) {
+  const w = voteWinners(post);
+  const parts = VOTE_CATEGORIES.filter(({ key }) => w[key] && !w[key].labels.includes('Nobody')).map(
+    ({ key, title }) => `${title.toLowerCase()}: ${w[key].labels.map((l) => l.split(' — ')[0]).join('/')}`,
+  );
+  return parts.length ? parts.join(', ') : null;
+}
+
 // Discord embed limits.
 const FIELD_VALUE_MAX = 1024;
 const MAX_CONTENT = 2000;
 
 /**
  * Render the stored squad post. Each squadmate's own lines become an embed
- * field, added as they're processed. Returns { content, embeds }.
+ * field, added as they're processed, followed by the squad vote. Returns
+ * { content, embeds, components } — components are the vote menus while the
+ * vote is open, and empty once it closes.
  */
 export function renderSquadPost(post) {
   let content = post.earlierLine ? `${post.header}\n\n${post.earlierLine}` : post.header;
@@ -294,5 +398,12 @@ export function renderSquadPost(post) {
     const value = text.length > FIELD_VALUE_MAX ? `${text.slice(0, FIELD_VALUE_MAX - 1)}…` : text;
     embed.addFields({ name: title, value });
   }
-  return { content, embeds: [embed] };
+  if (post.vote) {
+    embed.addFields({
+      name: post.vote.closed ? '🗳️ Squad verdict' : '🗳️ Squad vote',
+      value: voteFieldValue(post),
+    });
+  }
+  const components = post.vote && !post.vote.closed ? buildVoteMenus(post) : [];
+  return { content, embeds: [embed], components };
 }

@@ -20,6 +20,7 @@ import * as riot from './riotService.js';
 import * as rank from './rank.js';
 import { backfillTodayMatches } from './backfill.js';
 import { findLastSquadMatch, loadSquadMatch, buildSquadAnalysis } from './analyze.js';
+import { parseVoteCustomId, renderSquadPost, VOTE_CATEGORIES, VOTE_NOBODY } from './squad.js';
 import {
   buildCurseAppliedMessage,
   computePayoutMultiplier,
@@ -921,6 +922,39 @@ async function handleAnalyze5s(interaction) {
 }
 
 /**
+ * A squad vote dropdown pick. Only players from that game can vote; picks
+ * can be changed until the vote closes. The post re-renders with the new
+ * tallies in place, so voting adds no messages.
+ */
+async function handleSquadVote(interaction) {
+  const { matchId, category } = parseVoteCustomId(interaction.customId);
+  const post = storage.getSquadPost(matchId);
+  const pick = interaction.values?.[0];
+  const validPick = pick === VOTE_NOBODY || post?.vote?.roster?.some((r) => r.id === pick);
+
+  if (!post?.vote || post.vote.closed) {
+    await interaction.reply({ content: 'Voting on this game has closed.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!post.vote.voters.includes(interaction.user.id)) {
+    await interaction.reply({ content: 'Only players in this game can vote.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!VOTE_CATEGORIES.some((c) => c.key === category) || !validPick) {
+    await interaction.reply({ content: 'That vote option is no longer valid.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const updated = await storage.recordSquadBallot(matchId, interaction.user.id, category, pick);
+  if (!updated) {
+    await interaction.reply({ content: 'Voting on this game has closed.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  // update() acks the component interaction by editing the post it lives on.
+  await interaction.update({ ...renderSquadPost(updated), allowedMentions: { parse: [] } });
+}
+
+/**
  * Top-level dispatcher invoked from bot.js for every Discord interaction.
  * Routes slash commands, button clicks, and modal submits separately because
  * each has a different ack pattern (deferReply vs showModal vs reply).
@@ -958,6 +992,11 @@ export async function handleInteraction(interaction) {
       if (interaction.customId?.startsWith('bet:stake:')) {
         return await handleBetButton(interaction);
       }
+      return;
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      if (parseVoteCustomId(interaction.customId)) return await handleSquadVote(interaction);
       return;
     }
 
